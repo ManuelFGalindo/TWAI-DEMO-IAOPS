@@ -164,6 +164,14 @@ export function Clients() {
           ))}
         </div>
       )}
+
+      {/* Modal de Creación */}
+      {showCreateModal && (
+        <CreateClientModal
+          onClose={() => setShowCreateModal(false)}
+          onSuccess={loadClients}
+        />
+      )}
     </div>
   );
 }

@@ -26,7 +26,7 @@ async def create_client(client_data: ClientCreate):
         
         client = Client(
             id=client_id,
-            **client_data.dict(),
+            **client_data.model_dump(),
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
@@ -83,7 +83,7 @@ async def update_client(client_id: str, client_update: ClientUpdate):
     client = clients_db[client_id]
     
     # Actualizar campos
-    update_data = client_update.dict(exclude_unset=True)
+    update_data = client_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(client, field, value)
     
