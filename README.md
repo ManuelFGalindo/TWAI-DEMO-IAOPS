@@ -2,6 +2,10 @@
 
 **Intelligent AI Operations Platform** - Plataforma de orquestación inteligente multi-cloud y multi-repositorio.
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.109.0-009688.svg)](https://fastapi.tiangolo.com)
+
 ## 🎯 Visión General
 
 IAOPS es una plataforma de orquestación que permite a cada cliente gestionar su infraestructura tecnológica de manera inteligente, respetando sus estándares y tecnologías existentes.
@@ -48,8 +52,8 @@ iaops-platform/
 
 ```bash
 # Clonar repositorio
-git clone <repository-url>
-cd iaops-platform
+git clone https://github.com/antape2615/TWAI-DEMO-IAOPS.git
+cd TWAI-DEMO-IAOPS
 
 # Instalar dependencias del backend
 cd backend
@@ -77,7 +81,7 @@ docker-compose up -d
 
 La documentación completa está disponible en:
 - **Local**: `http://localhost:8001` (después de `mkdocs serve`)
-- **Producción**: [Enlace a docs]
+- **API Docs**: `http://localhost:8000/docs`
 
 ## 🔌 Conectores Disponibles
 
@@ -89,12 +93,12 @@ La documentación completa está disponible en:
 ### Repositorios
 - ✅ GitHub
 - ✅ GitLab
-- ✅ Bitbucket
+- 🚧 Bitbucket (en desarrollo)
 
 ### IA
 - ✅ OpenAI
 - ✅ Anthropic
-- ✅ Azure OpenAI
+- 🚧 Azure OpenAI
 
 ## 🔧 Configuración
 
@@ -116,6 +120,13 @@ La documentación completa está disponible en:
 }
 ```
 
+## 🧪 Tests
+
+```bash
+cd backend
+pytest tests/ -v --cov=app
+```
+
 ## 🤝 Contribuir
 
 Ver [CONTRIBUTING.md](CONTRIBUTING.md) para detalles sobre cómo contribuir al proyecto.
@@ -127,3 +138,17 @@ Ver [CONTRIBUTING.md](CONTRIBUTING.md) para detalles sobre cómo contribuir al p
 ## 👥 Equipo
 
 Desarrollado con ❤️ por el equipo de IAOPS
+
+## 🗺️ Roadmap
+
+- [x] Backend con FastAPI
+- [x] Conectores AWS, Azure, GCP
+- [x] Conectores GitHub, GitLab
+- [x] Orquestador de IA
+- [x] Documentación con MkDocs
+- [ ] Frontend con React
+- [ ] Base de datos PostgreSQL
+- [ ] Sistema de caché con Redis
+- [ ] Métricas y monitoring
+- [ ] Tests de integración completos
+- [ ] CI/CD con GitHub Actions
