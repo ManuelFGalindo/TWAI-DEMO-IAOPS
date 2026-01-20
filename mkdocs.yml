@@ -1,0 +1,82 @@
+site_name: IAOPS Platform
+site_description: Intelligent AI Operations Platform - Orquestación Multi-Cloud y Multi-Repositorio
+site_author: IAOPS Team
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - Inicio: index.md
+  - Guía de Inicio:
+      - Instalación: getting-started/installation.md
+      - Configuración: getting-started/configuration.md
+      - Primeros Pasos: getting-started/quickstart.md
+  - Arquitectura:
+      - Visión General: architecture/overview.md
+      - Conectores Cloud: architecture/cloud-connectors.md
+      - Conectores Repositorios: architecture/repo-connectors.md
+      - Orquestadores: architecture/orchestrators.md
+      - IA: architecture/ai-orchestrator.md
+  - API:
+      - Clientes: api/clients.md
+      - Arquitecturas: api/architecture.md
+      - Despliegues: api/deployments.md
+      - Recursos: api/resources.md
+  - Conectores:
+      - AWS: connectors/aws.md
+      - Azure: connectors/azure.md
+      - GCP: connectors/gcp.md
+      - GitHub: connectors/github.md
+      - GitLab: connectors/gitlab.md
+  - Casos de Uso:
+      - Multi-Cloud: use-cases/multi-cloud.md
+      - CI/CD Integration: use-cases/cicd.md
+      - Architecture as Code: use-cases/architecture-as-code.md
+  - Desarrollo:
+      - Contribuir: development/contributing.md
+      - Testing: development/testing.md
+      - Deployment: development/deployment.md
+
+markdown_extensions:
+  - admonition
+  - codehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+  - mkdocstrings
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/your-org/iaops-platform
