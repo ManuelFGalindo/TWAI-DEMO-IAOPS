@@ -4,6 +4,7 @@ import { Client } from '@/types';
 import { clientService } from '@/services/clientService';
 import { Loading } from '@/components/Loading';
 import { Alert } from '@/components/Alert';
+import { CreateClientModal } from '@/components/CreateClientModal';
 import toast from 'react-hot-toast';
 
 export function Clients() {

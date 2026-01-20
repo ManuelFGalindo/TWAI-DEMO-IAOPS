@@ -20,13 +20,15 @@ async def create_client(client_data: ClientCreate):
     Crea un nuevo cliente con su perfil tecnológico
     """
     try:
+        from datetime import datetime
+        
         client_id = str(uuid.uuid4())
         
         client = Client(
             id=client_id,
             **client_data.dict(),
-            created_at=None,
-            updated_at=None
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
         )
         
         # Guardar en storage
@@ -38,6 +40,7 @@ async def create_client(client_data: ClientCreate):
         
     except Exception as e:
         logger.error(f"Error creando cliente: {e}")
+        logger.exception("Stack trace:")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
