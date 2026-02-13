@@ -82,18 +82,27 @@ class AWSConnector(BaseCloudConnector):
             return []
     
     async def _list_ec2_instances(self) -> List[Dict[str, Any]]:
-        """Lista instancias EC2"""
+        """Lista instancias EC2 con estado enriquecido"""
         ec2 = self.session.client('ec2')
         response = ec2.describe_instances()
         
         instances = []
         for reservation in response['Reservations']:
             for instance in reservation['Instances']:
+                state = instance['State']['Name']
+                status = 'running' if state == 'running' else 'stopped' if state in ['stopped', 'terminated'] else 'pending'
+                
                 instances.append({
                     'id': instance['InstanceId'],
-                    'type': instance['InstanceType'],
-                    'state': instance['State']['Name'],
-                    'launch_time': str(instance['LaunchTime'])
+                    'name': next((tag['Value'] for tag in instance.get('Tags', []) if tag['Key'] == 'Name'), instance['InstanceId']),
+                    'type': 'ec2_instance',
+                    'state': state,
+                    'status': status,
+                    'launch_time': str(instance['LaunchTime']),
+                    'behavior': {
+                        'instance_type': instance['InstanceType'],
+                        'public_ip': instance.get('PublicIpAddress', 'None')
+                    }
                 })
         
         return instances
@@ -105,7 +114,10 @@ class AWSConnector(BaseCloudConnector):
         
         return [
             {
+                'id': bucket['Name'],
                 'name': bucket['Name'],
+                'type': 's3_bucket',
+                'status': 'active',
                 'creation_date': str(bucket['CreationDate'])
             }
             for bucket in response['Buckets']

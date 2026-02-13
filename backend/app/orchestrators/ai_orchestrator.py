@@ -5,7 +5,7 @@ from typing import Dict, Any, List, Optional
 import json
 from app.core.logging import logger
 from app.core.config import settings
-from app.models.schemas import Client, ArchitectureRequest, CloudProvider
+from app.models.schemas import Client, ArchitectureRequest, CloudProvider, ArchitectureResponse
 
 
 class AIOrchestrator:
@@ -50,15 +50,14 @@ class AIOrchestrator:
                 import anthropic
                 self.anthropic_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
                 logger.info("Anthropic client initialized")
-                
         except Exception as e:
             logger.warning(f"Error inicializando clientes de IA: {e}")
-    
+
     async def generate_architecture(
         self,
         client: Client,
         request: ArchitectureRequest
-    ) -> Dict[str, Any]:
+    ) -> ArchitectureResponse:
         """
         Genera una arquitectura completa respetando el tech profile del cliente
         
@@ -90,7 +89,8 @@ class AIOrchestrator:
         # Generar código de infraestructura
         infrastructure_code = await self._generate_infrastructure_code(
             client,
-            architecture
+            architecture,
+            infrastructure_standard=request.infrastructure_standard
         )
         
         # Estimar costos (placeholder)
@@ -99,13 +99,13 @@ class AIOrchestrator:
         # Generar recomendaciones
         recommendations = await self._generate_recommendations(client, architecture)
         
-        return {
-            'client_id': client.id,
-            'architecture': architecture,
-            'infrastructure_code': infrastructure_code,
-            'estimated_cost': estimated_cost,
-            'recommendations': recommendations
-        }
+        return ArchitectureResponse(
+            client_id=client.id,
+            architecture=architecture,
+            infrastructure_code=infrastructure_code,
+            estimated_cost=estimated_cost,
+            recommendations=recommendations
+        )
     
     def _build_client_context(self, client: Client) -> str:
         """
@@ -147,12 +147,11 @@ class AIOrchestrator:
         Construye el prompt para generar la arquitectura
         """
         prompt = f"""
-Eres un arquitecto de soluciones experto en cloud. Tu tarea es diseñar una arquitectura completa 
-RESPETANDO ESTRICTAMENTE el perfil tecnológico del cliente.
+Eres un arquitecto de soluciones experto en cloud. Tu tarea es diseñar una arquitectura basada en el requerimiento del cliente.
 
 {client_context}
 
-## Requerimiento del Cliente
+## Requerimiento del Cliente (PRIORIDAD MÁXIMA)
 {description}
 
 ## Requerimientos Técnicos
@@ -160,15 +159,16 @@ RESPETANDO ESTRICTAMENTE el perfil tecnológico del cliente.
 
 ## Tu Tarea
 Diseña una arquitectura que:
-1. Use SOLO las nubes permitidas por el cliente ({client_context})
-2. Use SOLO los servicios permitidos (si están especificados)
-3. Respete los estándares de infraestructura del cliente
-4. Sea escalable, segura y eficiente en costos
-5. Siga las mejores prácticas de cada cloud provider
+1. Resuelva EL REQUERIMIENTO DEL CLIENTE usando SOLO los recursos necesarios. NO agregues recursos no solicitados (como Kubernetes, Grafana, ELK, Application Gateway) a menos que el usuario los pida explícitamente.
+2. Use EL MENOR COSTO posible para entornos de prueba (ej: App Service Plan F1/B1, VMs B-series) a menos que se especifique producción.
+3. Use el Perfil Tecnológico anterior solo como lista de "servicios permitidos", NO como mandato de inclusión. Si el perfil menciona Kubernetes pero el usuario pide una Web App, SOLO genera la Web App.
+4. Use SOLO las nubes permitidas por el cliente.
+5. Siga las mejores prácticas de seguridad (pero sin agregar complejidad innecesaria).
 
 ## Formato de Respuesta (JSON)
 {{
     "architecture_overview": "Descripción general de la arquitectura",
+    "resource_group_name": "Nombre del grupo de recursos (ej: rg_peribank_app). Usa el indicado por el usuario o uno descriptivo.",
     "components": [
         {{
             "name": "Nombre del componente",
@@ -301,12 +301,14 @@ Genera SOLO el JSON, sin explicaciones adicionales.
     async def _generate_infrastructure_code(
         self,
         client: Client,
-        architecture: Dict[str, Any]
+        architecture: Dict[str, Any],
+        infrastructure_standard: Optional[str] = None
     ) -> str:
         """
         Genera código de infraestructura basado en la arquitectura
         """
-        infrastructure_standard = client.tech_profile.standards.infrastructure
+        if not infrastructure_standard:
+            infrastructure_standard = client.tech_profile.standards.infrastructure
         
         prompt = f"""
 Genera código de infraestructura usando {infrastructure_standard} para la siguiente arquitectura:
@@ -315,14 +317,46 @@ Genera código de infraestructura usando {infrastructure_standard} para la sigui
 
 Clouds a usar: {', '.join(client.tech_profile.clouds)}
 
-Genera código {infrastructure_standard} completo y funcional.
-Incluye:
-- Variables
-- Recursos principales
-- Outputs
-- Mejores prácticas de seguridad
+Reglas CRÍTICAS:
+1. Genera código COMPLETO y funcional.
+2. IMPORTANTE para Azure/Bicep/ARM: 
+   - NO incluyas el recurso 'Microsoft.Resources/resourceGroups'.
+   - REGLAS DE ESQUEMA Y NOMENCLATURA (Azure):
+      * 'Microsoft.Network/publicIPAddresses': El 'sku' (ej: {{ 'name': 'Standard' }}) DEBE ir al mismo nivel que 'name' y 'type', NUNCA dentro de 'properties'.
+      * 'Microsoft.Compute/disks': Usa la API version '2021-08-01' o superior (la version '2021-03-01' es inválida).
+      * 'Microsoft.Compute/virtualMachines': Para cada disco en 'dataDisks', DEBES asignar un 'lun' ÚNICO (empezando en 0).
+      * 'Microsoft.Network/networkInterfaces': El 'networkSecurityGroup' DEBE ir en 'properties' del NIC, NUNCA dentro de 'ipConfigurations'.
+      * PARA SUBREDES (ARM): Al usar `resourceId('Microsoft.Network/virtualNetworks/subnets', ...)`, DEBES pasar DOS argumentos de nombre: primero el nombre de la VNET y luego el de la SUBRED.
+      * 'Microsoft.Storage/storageAccounts': Usa la API version '2021-09-01' (la versión '2020-06-01' es inválida). El nombre debe tener entre 3 y 24 caracteres, SOLO letras minúsculas y números.
+      * CONSISTENCIA DE NOMBRES: Asegura que el nombre usado en 'resourceId' o referencias coincida EXACTAMENTE con el 'name' definido para ese recurso.
+      * PARA ARM TEMPLATES (JSON): NO uses la sección 'parameters' ni la propiedad 'provider' (causan errores de deserialización). Hardcodea valores directamente en 'resources'.
+      * PARA OUTPUTS (ARM): Usa strings hardcodeados para nombres (ej: 'value': 'pstorage001').
+      * 'Microsoft.Compute/disks': usa 'sku': {{ 'name': 'Standard_LRS' }} en lugar de 'properties.accountType'.
+      * 'Microsoft.ContainerService/managedClusters': Usa 'apiVersion': '2024-01-01' (o más reciente).
+      * 'Microsoft.ContainerService/managedClusters': Usa 'kubernetesVersion': '1.29.0'.
+      * 'Microsoft.ContainerService/managedClusters': Usa 'identity': {{ 'type': 'SystemAssigned' }} y OMITES COMPLETAMENTE 'servicePrincipalProfile'.
+      * 'Microsoft.ContainerService/managedClusters': En 'agentPoolProfiles', asegúrate de que el primer pool tenga 'mode': 'System' y 'name': 'agentpool'.
+      * 'Microsoft.ContainerService/managedClusters': DEBES incluir 'dnsPrefix': 'aks-dns' (o similar). NO puede estar vacío.
+      * 'Microsoft.Web/sites': Asegura que 'serverFarmId' esté dentro de 'properties'.
+      * 'Microsoft.Web/sites': DEBE incluir 'dependsOn': ['[resourceId(''Microsoft.Web/serverfarms'', ''nombre_del_plan'')]'] (reemplaza 'nombre_del_plan' por el nombre real).
+      * 'Microsoft.ContainerService/managedClusters': DEBES incluir 'dnsPrefix': 'aks-dns' (o similar). NO puede estar vacío.
+      * 'Microsoft.Web/sites': Asegura que 'serverFarmId' esté dentro de 'properties'.
+      * 'Microsoft.Web/sites': DEBE incluir 'dependsOn': ['[resourceId(''Microsoft.Web/serverfarms'', ''nombre_del_plan'')]'] (reemplaza 'nombre_del_plan' por el nombre real).
+      * 'Microsoft.Web/sites': Para 'siteConfig.linuxFxVersion', usa SOLO versiones LTS recientes: 'NODE|18-lts', 'PYTHON|3.11', 'DOTNETCORE|7.0'. NO USES versiones antiguas.
+      * 'Microsoft.Web/sites': El 'name' NO puede contener guiones bajos ('_'). Usa guiones medios ('-').
+      * 'Microsoft.Web/serverfarms': Usa 'sku': {{ 'name': 'S1', 'tier': 'Standard' }} (o acorde a lo pedido).
+      * PARA CUALQUIER RECURSO: Usa versiones de API estables y recientes (ej: 2021+ para Compute/Storage, 2023+ para Contenedores). NO uses versiones 'preview' a menos que sea estrictamente necesario.
+      * IMPORTANTE: Genera SOLO los recursos solicitados por el usuario. NO agregues clusters de Kubernetes (AKS) si el usuario pidió solo una VM, Storage o App Service.
+      * Asegura que todas las propiedades sigan el esquema oficial de Azure ARM/Bicep vigente.
+   - REGLAS DE SEGURIDAD Y SANITIZACIÓN:
+     * 'adminUsername': ELIMINA cualquier '@' o punto. Si el usuario pide 'admin@peribank.com', usa 'adminperibank'. Máximo 20 caracteres.
+     * 'adminPassword': DEBE ser hardcodeada y compleja (ej: 'IaOps.2026.Deploy!'), ignorando si el usuario provee una débil como '12345'.
+   - Asegura que todos los recursos dependientes estén EXPLICITAMENTE definidos y usa 'dependsOn' correctamente.
+   - Asegura que todos los recursos referenciados en 'outputs' o propiedades existan en el bloque 'resources'.
+3. Si es Terraform, incluye provider configuration y resource group con el nombre '{architecture.get('resource_group_name', 'iaops-rg')}'.
+4. Incluye outputs útiles (IPs, nombres de recursos).
 
-Retorna SOLO el código, sin explicaciones.
+Retorna SOLO el código, sin explicaciones ni markdown.
 """
         
         try:

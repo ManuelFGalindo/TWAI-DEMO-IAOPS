@@ -1,24 +1,32 @@
 import { api } from './api';
-import { DeploymentRequest, CloudProvider, ResourcesResponse } from '@/types';
+
+import { DeploymentRequest } from '@/types';
+
+export interface CodeDeploymentRequest {
+  client_id: string;
+  repo_url: string;
+  branch: string;
+  resource_id: string;
+  resource_type: string;
+  environment: string;
+}
 
 export const deploymentService = {
   // Desplegar infraestructura
-  async deploy(data: DeploymentRequest): Promise<any> {
-    const response = await api.post('/api/v1/deployments/deploy', data);
+  async deploy(request: DeploymentRequest): Promise<any> {
+    const response = await api.post('/deployments/deploy', request);
     return response.data;
   },
-};
 
-export const resourceService = {
-  // Listar recursos de un cliente
-  async list(
-    clientId: string,
-    cloudProvider: CloudProvider,
-    resourceType: string
-  ): Promise<ResourcesResponse> {
-    const response = await api.get(
-      `/api/v1/resources/${clientId}/${cloudProvider}/${resourceType}`
-    );
+  // Desplegar código desde repositorio a recurso cloud
+  async deployCode(request: CodeDeploymentRequest): Promise<any> {
+    const response = await api.post('/deployments/code', request);
     return response.data;
   },
+
+  // Obtener historial de despliegues
+  async getHistory(clientId: string): Promise<any[]> {
+    const response = await api.get(`/deployments/history/${clientId}`);
+    return response.data;
+  }
 };
