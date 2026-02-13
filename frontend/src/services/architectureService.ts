@@ -25,4 +25,8 @@ export const architectureService = {
     const response = await api.post('/architecture/estimate-cost', data);
     return response.data;
   },
+  // Eliminar arquitectura por id
+  async delete(id: string): Promise<void> {
+    await api.delete(`/architecture/${id}`);
+  },
 };

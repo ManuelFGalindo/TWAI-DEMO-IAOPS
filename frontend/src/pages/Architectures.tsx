@@ -15,6 +15,8 @@ export function Architectures() {
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editName, setEditName] = useState('');
     const [searchTerm, setSearchTerm] = useState('');
+    const [selectedArchitecture, setSelectedArchitecture] = useState<Architecture | null>(null);
+    const [showViewer, setShowViewer] = useState(false);
 
     useEffect(() => {
         loadClients();
@@ -185,16 +187,86 @@ export function Architectures() {
                             </div>
 
                             <div className="flex gap-2">
-                                <button className="btn btn-secondary flex-1 py-2 text-sm flex items-center justify-center gap-2">
+                                <button
+                                    onClick={() => { setSelectedArchitecture(arch); setShowViewer(true); }}
+                                    className="btn btn-secondary flex-1 py-2 text-sm flex items-center justify-center gap-2"
+                                >
                                     <Eye className="w-4 h-4" />
                                     Visualizar
                                 </button>
-                                <button className="btn btn-secondary p-2 group-hover:border-primary-200">
+
+                                <button
+                                    onClick={() => {
+                                        // Descargar JSON
+                                        const dataStr = JSON.stringify(arch, null, 2);
+                                        const blob = new Blob([dataStr], { type: 'application/json' });
+                                        const url = URL.createObjectURL(blob);
+                                        const a = document.createElement('a');
+                                        a.href = url;
+                                        a.download = `${(arch.name || 'arquitectura').replace(/\s+/g, '_')}_${arch.id}.json`;
+                                        document.body.appendChild(a);
+                                        a.click();
+                                        a.remove();
+                                        URL.revokeObjectURL(url);
+                                    }}
+                                    className="btn btn-secondary p-2 group-hover:border-primary-200"
+                                >
                                     <FileJson className="w-4 h-4 text-gray-500" />
+                                </button>
+
+                                <button
+                                    onClick={async () => {
+                                        const confirmed = window.confirm('¿Eliminar esta arquitectura? Esta acción no se puede deshacer.');
+                                        if (!confirmed) return;
+                                        try {
+                                            await architectureService.delete(arch.id!);
+                                            toast.success('Arquitectura eliminada');
+                                            loadHistory(selectedClientId);
+                                        } catch (error) {
+                                            toast.error('Error al eliminar arquitectura');
+                                        }
+                                    }}
+                                    className="btn btn-danger p-2 text-sm"
+                                >
+                                    Eliminar
                                 </button>
                             </div>
                         </div>
                     ))}
+                </div>
+            )}
+            {/* Visor Modal */}
+            {showViewer && selectedArchitecture && (
+                <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-lg max-w-4xl w-full max-h-[90vh] overflow-auto p-6">
+                        <div className="flex items-center justify-between mb-4">
+                            <h2 className="text-xl font-bold">Visualizar Arquitectura</h2>
+                            <div className="flex items-center gap-2">
+                                <button onClick={() => setShowViewer(false)} className="btn btn-secondary">Cerrar</button>
+                            </div>
+                        </div>
+
+                        <div className="space-y-4">
+                            <h3 className="font-semibold">Metadatos</h3>
+                            <pre className="bg-gray-100 p-4 rounded overflow-auto text-sm">{JSON.stringify({
+                                id: selectedArchitecture.id,
+                                name: selectedArchitecture.name,
+                                client_id: selectedArchitecture.client_id,
+                                created_at: selectedArchitecture.created_at,
+                                estimated_cost: selectedArchitecture.estimated_cost
+                            }, null, 2)}</pre>
+
+                            <h3 className="font-semibold">Arquitectura (JSON)</h3>
+                            <pre className="bg-gray-100 p-4 rounded overflow-auto text-sm">{JSON.stringify(selectedArchitecture.architecture, null, 2)}</pre>
+
+                            {selectedArchitecture.infrastructure_code && (
+                                <>
+                                    <h3 className="font-semibold">Código de Infraestructura</h3>
+                                    <pre className="bg-gray-900 text-white p-4 rounded overflow-auto text-sm whitespace-pre-wrap">{selectedArchitecture.infrastructure_code}</pre>
+                                </>
+                            )}
+                        </div>
+                    </div>
                 </div>
             )}
         </div>

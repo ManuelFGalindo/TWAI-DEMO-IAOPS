@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, Response
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -135,6 +135,28 @@ async def update_architecture(
         recommendations=[],
         created_at=arch.created_at
     )
+
+
+@router.delete("/{architecture_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_architecture(architecture_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Elimina una arquitectura guardada
+    """
+    result = await db.execute(
+        select(ArchitectureGenerationModel).where(ArchitectureGenerationModel.id == architecture_id)
+    )
+    arch = result.scalar_one_or_none()
+
+    if not arch:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Arquitectura no encontrada"
+        )
+
+    await db.delete(arch)
+    await db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.post("/estimate-cost")
 async def estimate_cost(request: ArchitectureRequest, db: AsyncSession = Depends(get_db)):
