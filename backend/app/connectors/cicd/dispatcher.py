@@ -184,6 +184,9 @@ on:
 env:
   AZURE_RESOURCE_ID: ${{{{ github.event.inputs.resource_id }}}}
   ENVIRONMENT: ${{{{ github.event.inputs.environment }}}}
+  # Note: These credentials should be added to your GitHub repository secrets
+  # Settings -> Secrets and variables -> Actions -> New repository secret
+  # AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
 
 jobs:
   deploy:
@@ -212,40 +215,75 @@ jobs:
           echo "Parsed Subscription: ${{subscription_id}}"
           echo "Parsed Resource Group: ${{resource_group}}"
       
-      - name: Deployment Summary
-        run: |
-          echo "===== DEPLOYMENT SUMMARY ====="
-          echo "Resource ID: ${{{{ env.AZURE_RESOURCE_ID }}}}"
-          echo "Environment: ${{{{ env.ENVIRONMENT }}}}"
-          echo "Resource Type: ${{{{ steps.parse.outputs.resource_type }}}}"
-          echo "Resource Name: ${{{{ steps.parse.outputs.resource_name }}}}"
-          echo "Subscription: ${{{{ steps.parse.outputs.subscription_id }}}}"
-          echo "Resource Group: ${{{{ steps.parse.outputs.resource_group }}}}"
-          echo "=============================="
-          echo ""
-          echo "NEXT STEPS:"
-          echo "1. Configure Azure credentials in repository secrets:"
-          echo "   - AZURE_CREDENTIALS (JSON from 'az ad sp create-for-rbac')"
-          echo "   - Or use AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID"
-          echo ""
-          echo "2. Add deployment steps based on resource type:"
-          echo "   - For App Service: az webapp up"
-          echo "   - For Container App: az containerapp up"
-          echo "   - For AKS: kubectl apply"
-          echo ""
-          echo "3. Example App Service deployment:"
-          echo "   az webapp deployment source config-zip -g RG -n APP_NAME --src app.zip"
+      - name: Setup Node.js
+        if: contains(steps.parse.outputs.resource_type, 'sites') # App Service
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
       
-      - name: Log deployment resource details
+      - name: Install dependencies
+        if: contains(steps.parse.outputs.resource_type, 'sites')
+        run: npm install
+        working-directory: ./
+      
+      - name: Build application
+        if: contains(steps.parse.outputs.resource_type, 'sites')
+        run: npm run build
+        working-directory: ./
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{{{ secrets.AZURE_CLIENT_ID }}}}
+          tenant-id: ${{{{ secrets.AZURE_TENANT_ID }}}}
+          subscription-id: ${{{{ secrets.AZURE_SUBSCRIPTION_ID }}}}
+      
+      - name: Deploy to App Service
+        if: contains(steps.parse.outputs.resource_type, 'sites')
         run: |
-          echo "Resource Details:"
-          echo "  Type: ${{{{ steps.parse.outputs.resource_type }}}}"
-          echo "  Name: ${{{{ steps.parse.outputs.resource_name }}}}"
-          echo "  Location: ${{{{ steps.parse.outputs.resource_group }}}}"
-          echo "  Environment: ${{{{ env.ENVIRONMENT }}}}"
+          # Create deployment package
+          if [ -d "dist" ]; then
+            cd dist
+            zip -r ../app.zip .
+            cd ..
+          elif [ -d "build" ]; then
+            cd build
+            zip -r ../app.zip .
+            cd ..
+          else
+            zip -r app.zip . -x "node_modules/*" ".git/*" "*.git*"
+          fi
+          
+          # Deploy to App Service
+          az webapp deployment source config-zip \\
+            --resource-group ${{{{ steps.parse.outputs.resource_group }}}} \\
+            --name ${{{{ steps.parse.outputs.resource_name }}}} \\
+            --src app.zip
+      
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "===== DEPLOYMENT SUCCESSFUL ====="
+          echo "Resource: ${{{{ steps.parse.outputs.resource_name }}}}"
+          echo "Resource Group: ${{{{ steps.parse.outputs.resource_group }}}}"
+          echo "Environment: ${{{{ env.ENVIRONMENT }}}}"
+          echo "App URL: https://${{{{ steps.parse.outputs.resource_name }}}}.azurewebsites.net"
+          echo "================================="
+      
+      - name: Deployment Failed
+        if: failure()
+        run: |
+          echo "===== DEPLOYMENT FAILED ====="
+          echo "Resource: ${{{{ steps.parse.outputs.resource_name }}}}"
+          echo "Resource Group: ${{{{ steps.parse.outputs.resource_group }}}}"
           echo ""
-          echo "TODO: Implement deployment steps for this resource"
-          echo "See: https://learn.microsoft.com/en-us/azure/app-service/deploy-github-actions"
+          echo "Troubleshooting:"
+          echo "1. Verify AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID secrets exist"
+          echo "2. Check that Service Principal has Contributor role on App Service"
+          echo "3. Verify resource exists: az webapp show -g RG -n APP_NAME"
+          echo "4. Check App Service logs: https://portal.azure.com"
+          echo "================================"
+          exit 1
 """
 
 
