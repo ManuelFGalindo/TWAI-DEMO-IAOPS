@@ -157,6 +157,7 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
         )
     
     logger.info(f"CICD credentials found for {cicd_type}")
+    logger.info(f"Credentials detail: provider={cicd_creds.provider}, token={cicd_creds.token[:20] if cicd_creds.token else 'NONE'}..., org={cicd_creds.organization}, project={cicd_creds.project}")
     
     # Crear registro de despliegue
     history = DeploymentHistoryModel(

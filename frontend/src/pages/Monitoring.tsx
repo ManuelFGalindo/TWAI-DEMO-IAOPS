@@ -22,11 +22,18 @@ interface ResourceQuery {
   resource_type: string;
 }
 
+interface ResourceExtended extends Resource {
+  location?: string;
+  zone?: string;
+  vm_size?: string;
+  sku?: string;
+}
+
 export function Monitoring() {
   const [resources, setResources] = useState<Resource[]>([]);
   const [clients, setClients] = useState<Client[]>([]);
   const [loading, setLoading] = useState(false);
-  const [selectedBehavior, setSelectedBehavior] = useState<any | null>(null);
+  const [selectedBehavior, setSelectedBehavior] = useState<Resource | null>(null);
   const [dashboardUrl, setDashboardUrl] = useState<string>('');
   const [creatingDashboard, setCreatingDashboard] = useState(false);
 
@@ -34,10 +41,22 @@ export function Monitoring() {
   const watchedClientId = watch('client_id');
 
   useEffect(() => {
-    loadClients();
-  }, []);
+    const loadClients = async () => {
+      try {
+        const data = await clientService.getAll();
+        setClients(data);
+        if (data.length > 0) {
+          setValue('client_id', data[0].id);
+        }
+      } catch (error) {
+        console.error('Error loading clients:', error);
+      }
+    };
 
-  const handleResourceSelect = async (resource: any) => {
+    loadClients();
+  }, [setValue]);
+
+  const handleResourceSelect = async (resource: Resource) => {
     setSelectedBehavior(resource);
     setDashboardUrl('');
 
@@ -60,28 +79,17 @@ export function Monitoring() {
         client_id: watchedClientId,
         resource_id: selectedBehavior.id,
         resource_type: selectedBehavior.type,
-        resource_name: selectedBehavior.name
+        resource_name: selectedBehavior.name || selectedBehavior.id
       });
       setDashboardUrl(response.dashboard_url);
       toast.success('Dashboard creado exitosamente');
-    } catch (error: any) {
+    } catch (error: unknown) {
+      const axiosError = error as { response?: { data?: { detail?: string } }; message?: string };
+      const errorMessage = axiosError?.response?.data?.detail || 'Error al crear el dashboard. Verifique la configuración en Settings.';
       console.error('Error creating dashboard:', error);
-      const errorMessage = error.response?.data?.detail || 'Error al crear el dashboard. Verifique la configuración en Settings.';
       toast.error(errorMessage);
     } finally {
       setCreatingDashboard(false);
-    }
-  };
-
-  const loadClients = async () => {
-    try {
-      const data = await clientService.getAll();
-      setClients(data);
-      if (data.length > 0) {
-        setValue('client_id', data[0].id);
-      }
-    } catch (error) {
-      console.error('Error loading clients:', error);
     }
   };
 
@@ -212,7 +220,7 @@ export function Monitoring() {
                         {resource.type}
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-600">
-                        {(resource as any).location || (resource as any).zone || '-'}
+                        {(resource as ResourceExtended).location || (resource as ResourceExtended).zone || '-'}
                       </td>
                       <td className="px-4 py-3">
                         <span
@@ -256,24 +264,27 @@ export function Monitoring() {
                 </div>
 
                 <div className="space-y-3">
-                  {selectedBehavior.behavior && Object.entries(selectedBehavior.behavior).map(([key, value]) => (
-                    <div key={key} className="flex justify-between border-b pb-2">
-                      <span className="text-sm text-gray-500 capitalize">{key.replace('_', ' ')}</span>
-                      <span className="text-sm font-medium text-gray-900">{String(value)}</span>
-                    </div>
-                  ))}
+                  {selectedBehavior.behavior && Object.entries(selectedBehavior.behavior).map(([key, value]: [string, unknown]) => {
+                    const displayValue: string = value !== null && value !== undefined ? String(value) : '-';
+                    return (
+                      <div key={key} className="flex justify-between border-b pb-2">
+                        <span className="text-sm text-gray-500 capitalize">{key.replace('_', ' ')}</span>
+                        <span className="text-sm font-medium text-gray-900">{displayValue as React.ReactNode}</span>
+                      </div>
+                    );
+                  })}
 
-                  {(selectedBehavior as any).vm_size && (
+                  {(selectedBehavior as ResourceExtended).vm_size && (
                     <div className="flex justify-between border-b pb-2">
                       <span className="text-sm text-gray-500">Hardware Profile</span>
-                      <span className="text-sm font-medium text-gray-900">{(selectedBehavior as any).vm_size}</span>
+                      <span className="text-sm font-medium text-gray-900">{(selectedBehavior as ResourceExtended).vm_size}</span>
                     </div>
                   )}
 
-                  {(selectedBehavior as any).sku && (
+                  {(selectedBehavior as ResourceExtended).sku && (
                     <div className="flex justify-between border-b pb-2">
                       <span className="text-sm text-gray-500">SKU / Precio</span>
-                      <span className="text-sm font-medium text-gray-900">{(selectedBehavior as any).sku}</span>
+                      <span className="text-sm font-medium text-gray-900">{(selectedBehavior as ResourceExtended).sku}</span>
                     </div>
                   )}
                 </div>

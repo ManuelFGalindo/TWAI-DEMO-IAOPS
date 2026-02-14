@@ -16,6 +16,7 @@ azure-identity==1.15.0  # Azure
 azure-mgmt-compute==30.5.0
 azure-mgmt-storage==21.1.0
 azure-mgmt-resource==23.0.1
+azure-mgmt-web==1.0.0
 google-cloud-compute==1.15.0  # GCP
 google-cloud-storage==2.14.0
 google-cloud-resource-manager==1.12.0
