@@ -59,26 +59,47 @@ async def list_deployable_resources(
         providers = [cloud_provider] if cloud_provider else client.tech_profile.get('clouds', ['azure'])
         
         for provider in providers:
+            # Normalizar provider (acepta enums o strings)
+            if hasattr(provider, 'value'):
+                provider_str = str(provider.value)
+            else:
+                provider_str = str(provider)
+            provider_str = provider_str.lower()
+
+            try:
+                provider_enum = CloudProvider(provider_str)
+            except Exception:
+                logger.warning(f"Proveedor desconocido en tech_profile: {provider}")
+                continue
+
             for resource_type in deployable_types:
                 try:
-                    # Normalizar provider a minúsculas para el Enum
-                    provider_enum = CloudProvider(provider.lower())
-                    
+                    # Mapear tipos de recursos a los nombres entendidos por los conectores
+                    mapping = {
+                        "Microsoft.Web/sites": "app_services",
+                        "Microsoft.Compute/virtualMachines": "vms",
+                        "Microsoft.Web/sites/functions": "functions",
+                        "Microsoft.ContainerInstance/containerGroups": "containers",
+                        "Microsoft.ContainerService/managedClusters": "aks"
+                    }
+
+                    connector_resource_type = mapping.get(resource_type, resource_type)
+
                     resources = await orchestrator.list_client_resources(
                         client=client,
                         cloud_provider=provider_enum,
-                        resource_type=resource_type
+                        resource_type=connector_resource_type
                     )
-                    
+
                     # Enriquecer con metadata
                     for res in resources:
-                        res['cloud_provider'] = provider
+                        res['cloud_provider'] = provider_str
                         res['deployable'] = True
                         res['resource_type_display'] = _get_display_name(resource_type)
-                    
+
                     all_resources.extend(resources)
                 except Exception as e:
-                    logger.warning(f"Error fetching {resource_type} from {provider}: {e}")
+                    logger.warning(f"Error fetching {resource_type} from {provider_str}: {e}")
                     continue
         
         return {
