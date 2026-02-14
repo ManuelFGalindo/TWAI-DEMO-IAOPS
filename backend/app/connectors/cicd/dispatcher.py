@@ -82,32 +82,59 @@ class GitHubActionsHandler(CICDHandler):
     
     async def dispatch_pipeline(self, client: httpx.AsyncClient, repo_url: str, branch: str, 
                                resource_id: str, environment: str) -> Tuple[bool, str]:
-        """Dispara workflow en GitHub"""
+        """Dispara workflow en GitHub con retry logic"""
         owner, repo = self._parse_repo(repo_url)
         if not owner or not repo:
             return False, "Invalid repo URL"
         
-        # Get workflow id
-        workflows_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows"
         headers = {"Authorization": f"token {self.token}", "Accept": "application/vnd.github.v3+json"}
-        
-        wf_resp = await client.get(workflows_url, headers=headers, timeout=10.0)
-        if wf_resp.status_code != 200:
-            return False, f"Error listing workflows: {wf_resp.status_code}"
-        
-        workflows = wf_resp.json().get("workflows", [])
         workflow_id = None
-        for wf in workflows:
-            path = wf.get("path", "")
-            if "deploy" in path.lower():
-                workflow_id = wf.get("id")
+        max_retries = 5
+        retry_delay = 2  # segundos
+        
+        # Retry logic: GitHub tarda en indexar workflows recién creados
+        for attempt in range(max_retries):
+            logger.info(f"Attempt {attempt + 1}/{max_retries} to find deploy workflow")
+            
+            workflows_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows"
+            wf_resp = await client.get(workflows_url, headers=headers, timeout=10.0)
+            
+            if wf_resp.status_code != 200:
+                logger.error(f"Error listing workflows (attempt {attempt + 1}): {wf_resp.status_code}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                continue
+            
+            workflows = wf_resp.json().get("workflows", [])
+            logger.info(f"Found {len(workflows)} workflows in {owner}/{repo}")
+            
+            # Buscar el workflow deploy.yml específicamente
+            for wf in workflows:
+                path = wf.get("path", "")
+                wf_id = wf.get("id")
+                wf_name = wf.get("name", "")
+                logger.debug(f"  - Workflow: path={path}, id={wf_id}, name={wf_name}")
+                
+                if ".github/workflows/deploy.yml" == path or path == ".github/workflows/deploy.yml":
+                    workflow_id = wf_id
+                    logger.info(f"Found deploy.yml workflow with ID: {workflow_id}")
+                    break
+            
+            if workflow_id:
                 break
+            
+            if attempt < max_retries - 1:
+                logger.warning(f"Deploy workflow not found, retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
         
         if not workflow_id:
-            return False, "No deploy workflow found"
+            logger.error(f"No deploy workflow found after {max_retries} attempts")
+            return False, "No deploy workflow found (max retries exceeded)"
         
         # Dispatch
         dispatch_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
+        logger.info(f"Dispatching workflow {workflow_id} with ref={branch}")
+        
         response = await client.post(
             dispatch_url,
             headers=headers,
@@ -115,8 +142,9 @@ class GitHubActionsHandler(CICDHandler):
             timeout=10.0
         )
         
+        logger.info(f"Dispatch response: {response.status_code}")
         if response.status_code == 204:
-            logger.info(f"GitHub workflow dispatched: {repo}")
+            logger.info(f"GitHub workflow dispatched successfully: {owner}/{repo}")
             return True, "dispatched"
         else:
             logger.error(f"Dispatch failed: {response.status_code} - {response.text}")
@@ -390,19 +418,29 @@ class CICDDispatcher:
         try:
             async with httpx.AsyncClient() as client:
                 # Validar credenciales
+                logger.info(f"Validating {cicd_type} credentials...")
                 if not await handler.validate_credentials(client):
                     logger.error(f"Invalid {cicd_type} credentials")
                     return False, f"Invalid credentials for {cicd_type}"
                 
+                logger.info(f"Credentials validated successfully")
+                
                 # Crear pipeline
+                logger.info(f"Creating pipeline in {repo_url}...")
                 success, msg = await handler.create_pipeline(client, repo_url, branch, resource_id, environment)
                 if not success:
                     logger.error(f"Failed to create pipeline: {msg}")
                     return False, msg
                 
-                await asyncio.sleep(1)
+                logger.info(f"Pipeline created successfully: {msg}")
+                
+                # GitHub needs more time to index the workflow
+                wait_time = 3 if cicd_type == "github-actions" else 1
+                logger.info(f"Waiting {wait_time}s for {cicd_type} to index new pipeline...")
+                await asyncio.sleep(wait_time)
                 
                 # Disparar pipeline
+                logger.info(f"Dispatching pipeline in {repo_url}...")
                 success, msg = await handler.dispatch_pipeline(client, repo_url, branch, resource_id, environment)
                 if not success:
                     logger.error(f"Failed to dispatch pipeline: {msg}")

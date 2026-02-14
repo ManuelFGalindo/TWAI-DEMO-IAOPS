@@ -178,9 +178,17 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
     await db.commit()
     
     try:
-        logger.info(f"Starting deployment via {cicd_type} for resource {request.resource_id}")
+        logger.info(f"Starting code deployment for resource {request.resource_id}" 
+                   f" via {cicd_type} in {request.environment}")
         
         # Usar el dispatcher para manejar el despliegue según el tipo de CI/CD
+        logger.info(f"Calling CICDDispatcher with:")
+        logger.info(f"  - cicd_type: {cicd_type}")
+        logger.info(f"  - repo_url: {request.repo_url}")
+        logger.info(f"  - branch: {request.branch}")
+        logger.info(f"  - resource_id: {request.resource_id}")
+        logger.info(f"  - environment: {request.environment}")
+        
         success, message = await CICDDispatcher.dispatch(
             cicd_type=cicd_type,
             token=cicd_creds.token,
@@ -191,6 +199,8 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
             organization=cicd_creds.organization,
             project=cicd_creds.project
         )
+        
+        logger.info(f"CICDDispatcher returned: success={success}, message={message}")
         
         if success:
             history.status = "completed"
@@ -206,6 +216,11 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
                 "details": message
             }
         else:
+            logger.error(f"Deployment failed: {message}")
+            history.status = "failed"
+            history.error_message = f"Dispatcher error: {message}"
+            history.completed_at = datetime.utcnow()
+            await db.commit()
             raise HTTPException(status_code=500, detail=message)
             
     except HTTPException:
