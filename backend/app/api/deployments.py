@@ -9,11 +9,12 @@ import re
 import base64
 import asyncio
 from app.models.schemas import DeploymentTarget, Client
-from app.models.database import ClientModel, DeploymentHistoryModel
+from app.models.database import ClientModel, DeploymentHistoryModel, CICDCredentialsModel
 from app.orchestrators.iaops_orchestrator import orchestrator
 from app.core.database import get_db
 from app.core.logging import logger
 from app.core.config_resolver import ConfigResolver
+from app.connectors.cicd.dispatcher import CICDDispatcher
 
 router = APIRouter()
 
@@ -109,8 +110,8 @@ async def deploy_infrastructure(request: DeploymentRequest, db: AsyncSession = D
 @router.post("/code")
 async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends(get_db)):
     """
-    Despliega código desde un repositorio GitHub hacia un recurso cloud usando GitHub Actions.
-    Crea el workflow de despliegue automáticamente si no existe.
+    Despliega código automáticamente según el tipo de CI/CD configurado en el cliente.
+    Soporta: GitHub Actions, Azure DevOps, GitLab CI, Jenkins, CircleCI
     """
     # Verificar cliente
     result = await db.execute(select(ClientModel).where(ClientModel.id == request.client_id))
@@ -122,25 +123,51 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
             detail=f"Cliente {request.client_id} no encontrado"
         )
     
-    # Obtener token de GitHub
-    resolver = ConfigResolver(db)
-    repo_config = await resolver.get_repository_config(request.client_id)
-    
-    if not repo_config or not repo_config.get('token'):
+    # Obtener tipo de CI/CD configurado
+    tech_profile = client_model.tech_profile
+    if not tech_profile or "standards" not in tech_profile:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No se encontró configuración de GitHub para este cliente"
+            detail="Cliente sin configuración de tecnología (standards)"
         )
+    
+    cicd_type = tech_profile.get("standards", {}).get("cicd")
+    if not cicd_type:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cliente sin tipo de CI/CD configurado"
+        )
+    
+    logger.info(f"Cliente {client_model.name} usa CI/CD type: {cicd_type}")
+    
+    # Obtener credenciales de CI/CD
+    cicd_creds_result = await db.execute(
+        select(CICDCredentialsModel).where(
+            (CICDCredentialsModel.client_id == request.client_id) &
+            (CICDCredentialsModel.provider == cicd_type) &
+            (CICDCredentialsModel.is_active == True)
+        )
+    )
+    cicd_creds = cicd_creds_result.scalar_one_or_none()
+    
+    if not cicd_creds:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No se encontraron credenciales de CI/CD ({cicd_type}) para este cliente"
+        )
+    
+    logger.info(f"CICD credentials found for {cicd_type}")
     
     # Crear registro de despliegue
     history = DeploymentHistoryModel(
         client_id=client_model.id,
-        cloud_provider="azure",
+        cloud_provider="multi-cloud",
         region="",
         environment=request.environment,
         status="running",
         deployment_data={
             "type": "code_deployment",
+            "cicd_provider": cicd_type,
             "repo_url": request.repo_url,
             "branch": request.branch,
             "resource_id": request.resource_id,
@@ -151,171 +178,36 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
     await db.commit()
     
     try:
-        # Extraer owner/repo
-        match = re.search(r'github\.com[:/]([^/]+)/([^/\.]+)', request.repo_url)
-        if not match:
-            raise ValueError(f"URL de repositorio inválida: {request.repo_url}")
+        logger.info(f"Starting deployment via {cicd_type} for resource {request.resource_id}")
         
-        owner, repo = match.group(1), match.group(2)
-        logger.info(f"Parsed GitHub repo: {owner}/{repo}")
+        # Usar el dispatcher para manejar el despliegue según el tipo de CI/CD
+        success, message = await CICDDispatcher.dispatch(
+            cicd_type=cicd_type,
+            token=cicd_creds.token,
+            repo_url=request.repo_url,
+            branch=request.branch,
+            resource_id=request.resource_id,
+            environment=request.environment,
+            organization=cicd_creds.organization,
+            project=cicd_creds.project
+        )
         
-        headers = {
-            "Authorization": f"token {repo_config['token']}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-
-        workflows_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows"
-
-        async with httpx.AsyncClient() as client:
-            # Listar workflows existentes
-            logger.info(f"Listing workflows from {workflows_url}")
-            wf_resp = await client.get(workflows_url, headers=headers, timeout=10.0)
-            if wf_resp.status_code != 200:
-                logger.error(f"GitHub list workflows error: {wf_resp.status_code} - {wf_resp.text}")
-                raise HTTPException(status_code=500, detail=f"Error listing workflows: {wf_resp.status_code}")
-
-            wf_json = wf_resp.json()
-            workflows = wf_json.get("workflows", []) if isinstance(wf_json, dict) else []
-            logger.info(f"Found {len(workflows)} workflows: {[w.get('path') for w in workflows]}")
-
-            # Buscar workflow de despliegue
-            workflow_id = None
-            for wf in workflows:
-                path = wf.get("path", "")
-                name = (wf.get("name") or "").lower()
-                wf_id = wf.get("id")
-                logger.debug(f"Checking workflow: path={path}, name={name}, id={wf_id}")
-                if path.endswith("deploy.yml") or path.endswith("deploy.yaml") or "deploy" in name:
-                    workflow_id = wf_id
-                    logger.info(f"Found existing workflow: id={workflow_id}")
-                    break
-
-            # Si no existe, crear
-            if not workflow_id:
-                logger.info(f"No deploy workflow found. Creating...")
-
-                workflow_path = ".github/workflows/deploy.yml"
-                script_path = ".github/scripts/deploy.sh"
-
-                deploy_yml = """name: Deploy (IAOPS generated)
-on:
-  workflow_dispatch:
-    inputs:
-      resource_id:
-        description: 'Resource ID'
-        required: true
-      environment:
-        description: 'Environment'
-        required: true
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run repo deploy script if present
-        run: |
-          if [ -f .github/scripts/deploy.sh ]; then
-            chmod +x .github/scripts/deploy.sh
-            .github/scripts/deploy.sh "${{ github.event.inputs.resource_id }}" "${{ github.event.inputs.environment }}"
-          else
-            echo "No deploy script found; add .github/scripts/deploy.sh to implement deployment."
-            exit 0
-          fi
-"""
-
-                deploy_sh = """#!/bin/bash
-RESOURCE_ID=$1
-ENVIRONMENT=$2
-echo "Placeholder deploy script. Resource: $RESOURCE_ID Environment: $ENVIRONMENT"
-# TODO: implement actual deployment  commands here
-"""
-
-                async def ensure_file(path: str, content: str) -> bool:
-                    contents_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-                    get_resp = await client.get(contents_url, headers=headers, params={"ref": request.branch}, timeout=10.0)
-                    if get_resp.status_code == 200:
-                        logger.info(f"File {path} already exists")
-                        return True
-                    
-                    logger.debug(f"Creating file {path}")
-                    payload = {
-                        "message": f"chore(ci): add {path} (generated by IAOPS)",
-                        "content": base64.b64encode(content.encode()).decode(),
-                        "branch": request.branch
-                    }
-                    put_resp = await client.put(contents_url, headers=headers, json=payload, timeout=10.0)
-                    if put_resp.status_code in (201, 200):
-                        logger.info(f"Created {path}")
-                        return True
-                    else:
-                        logger.error(f"Failed creating {path}: {put_resp.status_code} - {put_resp.text}")
-                        return False
-
-                created_wf = await ensure_file(workflow_path, deploy_yml)
-                created_script = await ensure_file(script_path, deploy_sh)
-
-                logger.info(f"File creation results: workflow={created_wf}, script={created_script}")
-
-                if not (created_wf or created_script):
-                    raise HTTPException(status_code=500, detail="Failed to create workflow/script")
-
-                await asyncio.sleep(2)
-
-                logger.info("Re-fetching workflows...")
-                wf_resp2 = await client.get(workflows_url, headers=headers, timeout=10.0)
-                if wf_resp2.status_code == 200:
-                    wf_json2 = wf_resp2.json()
-                    workflows = wf_json2.get("workflows", []) if isinstance(wf_json2, dict) else []
-                    logger.info(f"After creation, found {len(workflows)} workflows")
-                    
-                    for wf in workflows:
-                        path = wf.get("path", "")
-                        name = (wf.get("name") or "").lower()
-                        wf_id = wf.get("id")
-                        if path.endswith("deploy.yml") or path.endswith("deploy.yaml") or "deploy" in name:
-                            workflow_id = wf_id
-                            logger.info(f"Found new workflow: id={workflow_id}")
-                            break
-
-            if not workflow_id:
-                available = [wf.get("path") or wf.get("name") for wf in workflows]
-                logger.error(f"No deploy workflow found. Available: {available}")
-                raise HTTPException(status_code=404, detail=f"No deploy workflow found")
-
-            # Disparar workflow
-            dispatch_url = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches"
-            logger.info(f"Dispatching workflow: {dispatch_url}")
-
-            response = await client.post(
-                dispatch_url,
-                headers=headers,
-                json={
-                    "ref": request.branch,
-                    "inputs": {
-                        "resource_id": request.resource_id,
-                        "environment": request.environment
-                    }
-                },
-                timeout=10.0
-            )
-
-            if response.status_code == 204:
-                history.status = "completed"
-                history.completed_at = datetime.utcnow()
-                await db.commit()
-
-                logger.info(f"Deployment workflow dispatched successfully")
-                return {
-                    "status": "success",
-                    "message": f"Despliegue iniciado desde {request.branch} hacia {request.resource_id}",
-                    "deployment_id": str(history.id)
-                }
-            else:
-                error_msg = f"GitHub API error: {response.status_code} - {response.text}"
-                logger.error(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
-                
+        if success:
+            history.status = "completed"
+            history.completed_at = datetime.utcnow()
+            await db.commit()
+            
+            logger.info(f"Deployment {history.id} completed successfully via {cicd_type}")
+            return {
+                "status": "success",
+                "message": f"Despliegue iniciado exitosamente vía {cicd_type}",
+                "deployment_id": str(history.id),
+                "cicd_provider": cicd_type,
+                "details": message
+            }
+        else:
+            raise HTTPException(status_code=500, detail=message)
+            
     except HTTPException:
         raise
     except Exception as e:
