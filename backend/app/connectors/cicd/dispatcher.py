@@ -168,12 +168,12 @@ class GitHubActionsHandler(CICDHandler):
     
     @staticmethod
     def _get_github_workflow_template(resource_id: str, environment: str) -> str:
-        return f"""name: Deploy to {resource_id} ({environment})
+        return f"""name: Deploy to Azure - {environment}
 on:
   workflow_dispatch:
     inputs:
       resource_id:
-        description: 'Resource ID'
+        description: 'Azure Resource ID'
         required: true
         default: '{resource_id}'
       environment:
@@ -181,16 +181,71 @@ on:
         required: true
         default: '{environment}'
 
+env:
+  AZURE_RESOURCE_ID: ${{{{ github.event.inputs.resource_id }}}}
+  ENVIRONMENT: ${{{{ github.event.inputs.environment }}}}
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Deploy to ${{{{ github.event.inputs.resource_id }}}}
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Parse Azure Resource ID
+        id: parse
         run: |
-          echo "Deploying to resource: ${{{{ github.event.inputs.resource_id }}}}"
-          echo "Environment: ${{{{ github.event.inputs.environment }}}}"
-          # TODO: Implement deployment to ${{{{ github.event.inputs.resource_id }}}}
+          # Parse ARM resource ID
+          # Format: /subscriptions/{{subId}}/resourceGroups/{{rg}}/providers/{{provider}}/{{type}}/{{name}}
+          resource_type=$(echo "${{{{ env.AZURE_RESOURCE_ID }}}}" | grep -oP 'providers/[^/]+/\K[^/]+' || echo "unknown")
+          resource_name=$(echo "${{{{ env.AZURE_RESOURCE_ID }}}}" | grep -oP '/[^/]+$' | tr -d '/')
+          subscription_id=$(echo "${{{{ env.AZURE_RESOURCE_ID }}}}" | grep -oP 'subscriptions/\K[^/]+')
+          resource_group=$(echo "${{{{ env.AZURE_RESOURCE_ID }}}}" | grep -oP 'resourceGroups/\K[^/]+')
+          
+          echo "resource_type=${{resource_type}}" >> $GITHUB_OUTPUT
+          echo "resource_name=${{resource_name}}" >> $GITHUB_OUTPUT
+          echo "subscription_id=${{subscription_id}}" >> $GITHUB_OUTPUT
+          echo "resource_group=${{resource_group}}" >> $GITHUB_OUTPUT
+          
+          echo "Parsed Resource Type: ${{resource_type}}"
+          echo "Parsed Resource Name: ${{resource_name}}"
+          echo "Parsed Subscription: ${{subscription_id}}"
+          echo "Parsed Resource Group: ${{resource_group}}"
+      
+      - name: Deployment Summary
+        run: |
+          echo "===== DEPLOYMENT SUMMARY ====="
+          echo "Resource ID: ${{{{ env.AZURE_RESOURCE_ID }}}}"
+          echo "Environment: ${{{{ env.ENVIRONMENT }}}}"
+          echo "Resource Type: ${{{{ steps.parse.outputs.resource_type }}}}"
+          echo "Resource Name: ${{{{ steps.parse.outputs.resource_name }}}}"
+          echo "Subscription: ${{{{ steps.parse.outputs.subscription_id }}}}"
+          echo "Resource Group: ${{{{ steps.parse.outputs.resource_group }}}}"
+          echo "=============================="
+          echo ""
+          echo "NEXT STEPS:"
+          echo "1. Configure Azure credentials in repository secrets:"
+          echo "   - AZURE_CREDENTIALS (JSON from 'az ad sp create-for-rbac')"
+          echo "   - Or use AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID"
+          echo ""
+          echo "2. Add deployment steps based on resource type:"
+          echo "   - For App Service: az webapp up"
+          echo "   - For Container App: az containerapp up"
+          echo "   - For AKS: kubectl apply"
+          echo ""
+          echo "3. Example App Service deployment:"
+          echo "   az webapp deployment source config-zip -g RG -n APP_NAME --src app.zip"
+      
+      - name: Log deployment resource details
+        run: |
+          echo "Resource Details:"
+          echo "  Type: ${{{{ steps.parse.outputs.resource_type }}}}"
+          echo "  Name: ${{{{ steps.parse.outputs.resource_name }}}}"
+          echo "  Location: ${{{{ steps.parse.outputs.resource_group }}}}"
+          echo "  Environment: ${{{{ env.ENVIRONMENT }}}}"
+          echo ""
+          echo "TODO: Implement deployment steps for this resource"
+          echo "See: https://learn.microsoft.com/en-us/azure/app-service/deploy-github-actions"
 """
 
 
