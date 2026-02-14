@@ -56,7 +56,15 @@ async def list_deployable_resources(
     
     try:
         # Si se especifica cloud provider, solo buscar en ese
-        providers = [cloud_provider] if cloud_provider else client.tech_profile.get('clouds', ['azure'])
+        if cloud_provider:
+            providers = [cloud_provider]
+        else:
+            # `tech_profile` es un Pydantic model; acceder a la lista `clouds`
+            try:
+                providers = client.tech_profile.clouds or ['azure']
+            except Exception:
+                logger.warning("tech_profile no tiene atributo 'clouds', usando 'azure' por defecto")
+                providers = ['azure']
         
         for provider in providers:
             # Normalizar provider (acepta enums o strings)
