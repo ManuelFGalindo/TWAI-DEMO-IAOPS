@@ -8,6 +8,7 @@ import httpx
 import re
 import base64
 import asyncio
+import os
 from app.models.schemas import DeploymentTarget, Client
 from app.models.database import ClientModel, DeploymentHistoryModel, CICDCredentialsModel
 from app.orchestrators.iaops_orchestrator import orchestrator
@@ -33,6 +34,8 @@ class CodeDeploymentRequest(BaseModel):
     resource_id: str
     resource_type: str
     environment: str = "production"
+    application_type: str = "nodejs"  # nodejs, python, dotnet, java, go
+    use_ai_pipeline: bool = True  # Usar IA para generar el pipeline
 
 @router.post("/deploy")
 async def deploy_infrastructure(request: DeploymentRequest, db: AsyncSession = Depends(get_db)):
@@ -182,6 +185,29 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
         logger.info(f"Starting code deployment for resource {request.resource_id}" 
                    f" via {cicd_type} in {request.environment}")
         
+        # Get Azure credentials from environment (for GitHub Actions)
+        azure_credentials = None
+        if cicd_type.lower() == "github-actions":
+            azure_credentials = {
+                "AZURE_CLIENT_ID": os.getenv("AZURE_CLIENT_ID", ""),
+                "AZURE_CLIENT_SECRET": os.getenv("AZURE_CLIENT_SECRET", ""),
+                "AZURE_TENANT_ID": os.getenv("AZURE_TENANT_ID", ""),
+                "AZURE_SUBSCRIPTION_ID": os.getenv("AZURE_SUBSCRIPTION_ID", "")
+            }
+            logger.info(f"[Deploy] Azure credentials loaded: client_id={azure_credentials['AZURE_CLIENT_ID'][:8] if azure_credentials['AZURE_CLIENT_ID'] else 'NONE'}...")
+        
+        # Extraer información del cliente para la generación de pipeline con IA
+        client_info = {
+            "id": client_model.id,
+            "name": client_model.name,
+            "use_ai": request.use_ai_pipeline,
+            "resource_type": request.resource_type,
+            "resource_name": _extract_resource_name(request.resource_id),
+            "resource_group": _extract_resource_group(request.resource_id),
+            "application_type": request.application_type,
+            "cicd_provider": cicd_type
+        }
+        
         # Usar el dispatcher para manejar el despliegue según el tipo de CI/CD
         logger.info(f"Calling CICDDispatcher with:")
         logger.info(f"  - cicd_type: {cicd_type}")
@@ -189,6 +215,7 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
         logger.info(f"  - branch: {request.branch}")
         logger.info(f"  - resource_id: {request.resource_id}")
         logger.info(f"  - environment: {request.environment}")
+        logger.info(f"  - use_ai_pipeline: {request.use_ai_pipeline}")
         
         success, message = await CICDDispatcher.dispatch(
             cicd_type=cicd_type,
@@ -198,7 +225,9 @@ async def deploy_code(request: CodeDeploymentRequest, db: AsyncSession = Depends
             resource_id=request.resource_id,
             environment=request.environment,
             organization=cicd_creds.organization,
-            project=cicd_creds.project
+            project=cicd_creds.project,
+            azure_credentials=azure_credentials,
+            client_info=client_info
         )
         
         logger.info(f"CICDDispatcher returned: success={success}, message={message}")
@@ -250,3 +279,42 @@ async def get_deployment_history(client_id: str, db: AsyncSession = Depends(get_
     )
     history = result.scalars().all()
     return history
+
+
+def _extract_resource_name(resource_id: str) -> str:
+    """
+    Extrae el nombre del recurso desde un Azure Resource ID
+    
+    Ejemplo: /subscriptions/xxx/resourceGroups/rg-app/providers/Microsoft.Web/sites/myapp
+    Retorna: myapp
+    """
+    if not resource_id:
+        return "app"
+    
+    # Tomar el último segmento después de /
+    parts = resource_id.rstrip('/').split('/')
+    if parts:
+        return parts[-1]
+    return "app"
+
+
+def _extract_resource_group(resource_id: str) -> str:
+    """
+    Extrae el nombre del grupo de recursos desde un Azure Resource ID
+    
+    Ejemplo: /subscriptions/xxx/resourceGroups/rg-app/providers/Microsoft.Web/sites/myapp
+    Retorna: rg-app
+    """
+    if not resource_id:
+        return "rg-default"
+    
+    # Buscar resourceGroups en el path
+    parts = resource_id.split('/')
+    try:
+        rg_index = parts.index('resourceGroups')
+        if rg_index + 1 < len(parts):
+            return parts[rg_index + 1]
+    except ValueError:
+        pass
+    
+    return "rg-default"

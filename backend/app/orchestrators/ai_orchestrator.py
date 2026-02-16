@@ -15,6 +15,7 @@ class AIOrchestrator:
     Responsable de:
     - Generar arquitecturas respetando el tech profile del cliente
     - Generar código de infraestructura (Terraform, CloudFormation, ARM)
+    - Generar pipelines de CI/CD automáticamente
     - Diseñar soluciones alineadas a las tecnologías del cliente
     - Estimar costos
     - Generar recomendaciones
@@ -440,6 +441,235 @@ Retorna SOLO el código, sin explicaciones ni markdown.
         )
         
         return recommendations
+
+    async def generate_cicd_pipeline(
+        self,
+        client: Client,
+        resource_type: str,
+        resource_name: str,
+        resource_group: str,
+        cloud_provider: str,
+        application_type: str = "nodejs"
+    ) -> Dict[str, Any]:
+        """
+        Genera un pipeline de CI/CD basado en la configuración del cliente
+        
+        Args:
+            client: Cliente con su perfil tecnológico
+            resource_type: Tipo de recurso (sites, containerApps, managedClusters, etc.)
+            resource_name: Nombre del recurso
+            resource_group: Grupo de recursos
+            cloud_provider: Proveedor de nube (azure, aws, gcp)
+            application_type: Tipo de aplicación (nodejs, python, dotnet, java, go)
+            
+        Returns:
+            Diccionario con el pipeline generado y metadatos
+        """
+        logger.info(f"Generando pipeline CI/CD para {client.id} - {resource_type}")
+        
+        # Obtener el tipo de CI/CD del cliente
+        cicd_provider = client.tech_profile.standards.cicd if client.tech_profile.standards else "github_actions"
+        
+        # Construir el contexto
+        prompt = self._build_cicd_prompt(
+            client_name=client.name,
+            cicd_provider=cicd_provider,
+            cloud_provider=cloud_provider,
+            resource_type=resource_type,
+            resource_name=resource_name,
+            resource_group=resource_group,
+            application_type=application_type
+        )
+        
+        # Generar con IA
+        pipeline_response = await self._call_ai(prompt)
+        
+        # Parsear respuesta
+        pipeline = self._parse_cicd_response(pipeline_response, cicd_provider)
+        
+        return {
+            'pipeline_content': pipeline.get('content', ''),
+            'file_path': pipeline.get('file_path', ''),
+            'cicd_provider': cicd_provider,
+            'cloud_provider': cloud_provider,
+            'resource_type': resource_type,
+            'metadata': pipeline.get('metadata', {})
+        }
+
+    def _build_cicd_prompt(
+        self,
+        client_name: str,
+        cicd_provider: str,
+        cloud_provider: str,
+        resource_type: str,
+        resource_name: str,
+        resource_group: str,
+        application_type: str
+    ) -> str:
+        """
+        Construye el prompt para generar el pipeline CI/CD
+        """
+        # Mapeo de tipos de recurso a servicios
+        resource_mapping = {
+            'sites': 'Azure App Service',
+            'containerApps': 'Azure Container Apps',
+            'managedClusters': 'Azure Kubernetes Service (AKS)',
+            'functionApp': 'Azure Functions',
+            'virtualMachines': 'Azure Virtual Machines',
+            'aws_instance': 'AWS EC2',
+            'aws_ecs': 'AWS ECS',
+            'aws_eks': 'AWS EKS',
+            'aws_lambda': 'AWS Lambda',
+            'compute.googleapis.com': 'Google Compute Engine',
+            'kubernetes.io/cluster': 'GKE'
+        }
+        
+        # Mapeo de tipos de aplicación a versiones
+        app_versions = {
+            'nodejs': '18',
+            'python': '3.11',
+            'dotnet': '7.0',
+            'java': '17',
+            'go': '1.21'
+        }
+        
+        app_version = app_versions.get(application_type, 'latest')
+        
+        # Detectar el tipo de pipeline
+        cicd_info = self._get_cicd_info(cicd_provider)
+        
+        prompt = f"""
+Eres un experto en CI/CD y DevOps. Tu tarea es generar un pipeline de CI/CD completo y funcional.
+
+## Contexto del Cliente
+- Cliente: {client_name}
+- Proveedor CI/CD: {cicd_provider}
+- Proveedor Cloud: {cloud_provider}
+- Tipo de Recurso: {resource_type} ({resource_mapping.get(resource_type, resource_type)})
+- Nombre del Recurso: {resource_name}
+- Grupo de Recursos: {resource_group}
+- Tipo de Aplicación: {application_type}
+- Versión: {app_version}
+
+## Tu Tarea
+Genera un archivo de pipeline CI/CD COMPLETO y FUNCIONAL que:
+1. Haga checkout del código
+2. Instale las dependencias apropiadas
+3. Ejecute tests (si aplica)
+4. Haga build de la aplicación
+5. Haga deploy al recurso especificado
+
+## Reglas CRÍTICAS:
+
+### Para GitHub Actions (.github/workflows/deploy.yml):
+- El pipeline DEBE incluir `workflow_dispatch` trigger para permitir ejecución manual
+- Usa la acción `azure/login@v1` para autenticarse en Azure
+- Para Azure App Service: usa `az webapp deployment source config-zip`
+- Para AKS: usa `az aks get-credentials` y `kubectl apply`
+- Para Container Apps: usa `az containerapp up` o `az containerapp deployment`
+- Para Functions: usa `azure/functions-action@v1`
+- Incluye secretos: AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+- Parsing del resource ID: extrae subscription, resource group, y nombre del recurso
+- Incluye pasos de verificación post-despliegue
+
+### Formato de workflow_dispatch:
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'production'
+```
+
+### Para Azure DevOps (azure-pipelines.yml):
+- Usa el task `AzureWebApp@1` para App Service
+- Usa `Kubernetes@1` para AKS
+- Usa `AzureContainerApp@1` para Container Apps
+
+### Para GitLab CI (.gitlab-ci.yml):
+- Usa `azure/cli` o `docker` con Azure CLI
+- Implementa stages: build, test, deploy
+
+### Para Jenkins (Jenkinsfile):
+- Pipeline scripted o declarative
+- Usa Azure CLI o plugins de Azure
+
+### Para CircleCI (.circleci/config.yml):
+- Usa orbs de Azure (`circleci/azure-orb`)
+
+## Formato de Respuesta (JSON)
+{{"file_path": ".github/workflows/deploy.yml", "content": "...pipeline yaml...", "metadata": {{}}}}
+
+Retorna SOLO el JSON, sin explicaciones adicionales.
+"""
+        return prompt
+    
+    def _get_cicd_info(self, cicd_provider: str) -> Dict[str, Any]:
+        """Obtiene información del proveedor CI/CD"""
+        cicd_map = {
+            'github_actions': {
+                'name': 'GitHub Actions',
+                'file': '.github/workflows/deploy.yml',
+                'workflow_dispatch': True
+            },
+            'azure_devops': {
+                'name': 'Azure DevOps',
+                'file': 'azure-pipelines.yml',
+                'trigger': True
+            },
+            'gitlab_ci': {
+                'name': 'GitLab CI',
+                'file': '.gitlab-ci.yml',
+                'stages': ['build', 'test', 'deploy']
+            },
+            'jenkins': {
+                'name': 'Jenkins',
+                'file': 'Jenkinsfile',
+                'type': 'declarative'
+            },
+            'circleci': {
+                'name': 'CircleCI',
+                'file': '.circleci/config.yml',
+                'orbs': ['azure']
+            }
+        }
+        return cicd_map.get(cicd_provider, cicd_map['github_actions'])
+    
+    def _parse_cicd_response(self, response: str, cicd_provider: str) -> Dict[str, Any]:
+        """
+        Parsea la respuesta de la IA para el pipeline CI/CD
+        """
+        try:
+            # Limpiar respuesta si tiene markdown
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            if response.startswith("```"):
+                response = response[3:]
+            if response.endswith("```"):
+                response = response[:-3]
+            
+            parsed = json.loads(response.strip())
+            
+            # Validar que tiene los campos necesarios
+            if 'content' not in parsed:
+                # Si no hay campo content, intentar obtener el contenido de otra forma
+                parsed = {'content': response, 'file_path': '.github/workflows/deploy.yml', 'metadata': {}}
+            
+            return parsed
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parseando respuesta de CI/CD: {e}")
+            logger.error(f"Respuesta: {response}")
+            
+            # Retornar respuesta genérica
+            return {
+                'content': response,
+                'file_path': self._get_cicd_info(cicd_provider).get('file', '.github/workflows/deploy.yml'),
+                'metadata': {'error': str(e)}
+            }
 
 
 # Singleton global

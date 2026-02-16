@@ -1,28 +1,26 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Cloud, Loader2, CheckCircle, XCircle, Clock, ExternalLink, Play, GitBranch, Github, GitMerge } from 'lucide-react';
 import { api } from '@/services/api';
 import { clientService } from '@/services/clientService';
 import { repositoryService, Branch, Commit } from '@/services/repositoryService';
 import { resourceService, DeployableResource } from '@/services/resourceService';
-import { deploymentService } from '@/services/deploymentService';
+import { deploymentService, DeploymentHistoryItem } from '@/services/deploymentService';
 import { Client } from '@/types';
 import { format } from 'date-fns';
 import { es } from 'date-fns/locale';
 import { clsx } from 'clsx';
 import toast from 'react-hot-toast';
 
-interface DeploymentRecord {
+interface Repository {
     id: string;
-    client_id: string;
-    cloud_provider: string;
-    region: string;
-    environment: string;
-    status: string;
-    error_message?: string;
-    created_at: string;
-    completed_at?: string;
-    deployment_data: any;
+    name: string;
+    url: string;
+    clone_url: string;
+    provider: string;
+    private?: boolean;
 }
+
+interface DeploymentRecord extends DeploymentHistoryItem {}
 
 export function Deployments() {
     const [deployments, setDeployments] = useState<DeploymentRecord[]>([]);
@@ -32,8 +30,8 @@ export function Deployments() {
     const [activeTab, setActiveTab] = useState<'new' | 'history' | 'verification' | 'repositories'>('history');
 
     // Repository states
-    const [repositories, setRepositories] = useState<any[]>([]);
-    const [selectedRepo, setSelectedRepo] = useState<any | null>(null);
+    const [repositories, setRepositories] = useState<Repository[]>([]);
+    const [selectedRepo, setSelectedRepo] = useState<Repository | null>(null);
     const [branches, setBranches] = useState<Branch[]>([]);
     const [commits, setCommits] = useState<Commit[]>([]);
     const [selectedBranch, setSelectedBranch] = useState('main');
@@ -43,34 +41,8 @@ export function Deployments() {
     const [selectedResource, setSelectedResource] = useState<string>('');
     const [selectedEnvironment, setSelectedEnvironment] = useState<string>('production');
 
-    useEffect(() => {
-        loadClients();
-    }, []);
-
-    useEffect(() => {
-        if (selectedClientId && activeTab === 'repositories') {
-            loadRepositories();
-        }
-        if (selectedClientId && activeTab === 'new') {
-            loadDeployableResources();
-            loadRepositories(); // También cargar repos para el formulario
-        }
-    }, [selectedClientId, activeTab]);
-
-    const loadClients = async () => {
-        try {
-            const data = await clientService.getAll();
-            setClients(data);
-            if (data.length > 0) {
-                setSelectedClientId(data[0].id);
-                loadHistory(data[0].id);
-            }
-        } catch (error) {
-            console.error('Error loading clients:', error);
-        }
-    };
-
-    const loadHistory = async (clientId: string) => {
+    // Move loadHistory before loadClients since it's called by loadClients
+    const loadHistory = useCallback(async (clientId: string) => {
         if (!clientId) return;
         setLoading(true);
         try {
@@ -81,9 +53,54 @@ export function Deployments() {
         } finally {
             setLoading(false);
         }
-    };
+    }, []);
 
-    const loadRepositories = async () => {
+    const loadClients = useCallback(async () => {
+        try {
+            const data = await clientService.getAll();
+            setClients(data);
+            if (data.length > 0) {
+                setSelectedClientId(data[0].id);
+                loadHistory(data[0].id);
+            }
+        } catch (error) {
+            console.error('Error loading clients:', error);
+        }
+    }, [loadHistory]);
+
+    useEffect(() => {
+        loadClients();
+    }, [loadClients]);
+
+    const loadDeployableResources = useCallback(async () => {
+        if (!selectedClientId) return;
+        setLoading(true);
+        try {
+            const resources = await resourceService.listDeployableResources(selectedClientId);
+            setDeployableResources(resources);
+        } catch (error) {
+            console.error('Error loading deployable resources:', error);
+        } finally {
+            setLoading(false);
+        }
+    }, [selectedClientId]);
+
+    const handleRepoSelect = useCallback(async (repo: Repository) => {
+        setSelectedRepo(repo);
+        try {
+            const branchData = await repositoryService.listBranches(selectedClientId, repo.clone_url || repo.url);
+            setBranches(branchData);
+            if (branchData.length > 0) {
+                setSelectedBranch(branchData[0].name);
+                const commitData = await repositoryService.listCommits(selectedClientId, repo.clone_url || repo.url, branchData[0].name);
+                setCommits(commitData);
+            }
+        } catch (error) {
+            console.error('Error loading repo data:', error);
+        }
+    }, [selectedClientId]);
+
+    const loadRepositories = useCallback(async () => {
         if (!selectedClientId) return;
         setLoading(true);
         try {
@@ -97,36 +114,17 @@ export function Deployments() {
         } finally {
             setLoading(false);
         }
-    };
+    }, [selectedClientId, handleRepoSelect]);
 
-    const loadDeployableResources = async () => {
-        if (!selectedClientId) return;
-        setLoading(true);
-        try {
-            const resources = await resourceService.listDeployableResources(selectedClientId);
-            setDeployableResources(resources);
-        } catch (error) {
-            console.error('Error loading deployable resources:', error);
-            toast.error('Error al cargar recursos desplegables');
-        } finally {
-            setLoading(false);
+    useEffect(() => {
+        if (selectedClientId && activeTab === 'repositories') {
+            loadRepositories();
         }
-    };
-
-    const handleRepoSelect = async (repo: any) => {
-        setSelectedRepo(repo);
-        try {
-            const branchData = await repositoryService.listBranches(selectedClientId, repo.clone_url || repo.url);
-            setBranches(branchData);
-            if (branchData.length > 0) {
-                setSelectedBranch(branchData[0].name);
-                const commitData = await repositoryService.listCommits(selectedClientId, repo.clone_url || repo.url, branchData[0].name);
-                setCommits(commitData);
-            }
-        } catch (error) {
-            console.error('Error loading repo data:', error);
+        if (selectedClientId && activeTab === 'new') {
+            loadDeployableResources();
+            loadRepositories(); // También cargar repos para el formulario
         }
-    };
+    }, [selectedClientId, activeTab, loadRepositories, loadDeployableResources]);
 
     const handleBranchChange = async (branch: string) => {
         setSelectedBranch(branch);
@@ -165,16 +163,20 @@ export function Deployments() {
                 repo_url: selectedRepo.clone_url || selectedRepo.url,
                 branch: selectedBranch,
                 resource_id: selectedResource,
-                resource_type: selectedResourceObj?.resource_type_display || 'unknown',
-                environment: selectedEnvironment
+                resource_type: selectedResourceObj?.resource_type_display || 'sites',
+                environment: selectedEnvironment,
+                application_type: 'nodejs',  // Could be made configurable in UI
+                use_ai_pipeline: true  // Enable AI-generated pipelines
             });
 
             toast.success('¡Despliegue iniciado exitosamente!');
             setActiveTab('history');
             loadHistory(selectedClientId);
-        } catch (error: any) {
+        } catch (error: unknown) {
+            const axiosError = error as { response?: { data?: { detail?: string } }; message?: string };
+            const errorMessage = axiosError?.response?.data?.detail || 'Error al iniciar el despliegue';
             console.error('Error deploying code:', error);
-            toast.error(error.response?.data?.detail || 'Error al iniciar el despliegue');
+            toast.error(errorMessage);
         } finally {
             setLoading(false);
         }
@@ -194,7 +196,9 @@ export function Deployments() {
         }
     };
 
-    const tabs = [
+    type TabId = 'new' | 'history' | 'verification' | 'repositories';
+    
+    const tabs: Array<{ id: TabId; name: string; icon: typeof Play }> = [
         { id: 'new', name: 'Nuevo Despliegue', icon: Play },
         { id: 'history', name: 'Histórico', icon: Clock },
         { id: 'verification', name: 'Verificación', icon: CheckCircle },
@@ -230,7 +234,7 @@ export function Deployments() {
                 {tabs.map((tab) => (
                     <button
                         key={tab.id}
-                        onClick={() => setActiveTab(tab.id as any)}
+                        onClick={() => setActiveTab(tab.id)}
                         className={clsx(
                             'flex items-center space-x-2 px-4 py-2 text-sm font-medium rounded-lg transition-all',
                             activeTab === tab.id
@@ -334,7 +338,7 @@ export function Deployments() {
                                         }}
                                     >
                                         <option value="">Seleccionar repositorio...</option>
-                                        {repositories.map((repo: any) => (
+                                        {repositories.map((repo: Repository) => (
                                             <option key={repo.id} value={repo.id}>
                                                 {repo.name} {repo.private ? '🔒' : ''}
                                             </option>
@@ -360,7 +364,7 @@ export function Deployments() {
                                         <option value="">
                                             {loading ? 'Cargando recursos...' : 'Seleccionar recurso...'}
                                         </option>
-                                        {deployableResources.map((resource: any) => (
+                                        {deployableResources.map((resource: DeployableResource) => (
                                             <option key={resource.id} value={resource.id}>
                                                 {resource.name} ({resource.resource_type_display}) - {resource.location || resource.region}
                                             </option>
@@ -459,7 +463,7 @@ export function Deployments() {
                                     <p className="text-sm text-gray-500">No hay repositorios configurados</p>
                                 ) : (
                                     <div className="space-y-2">
-                                        {repositories.map((repo: any) => (
+                                        {repositories.map((repo: Repository) => (
                                             <button
                                                 key={repo.id}
                                                 onClick={() => handleRepoSelect(repo)}

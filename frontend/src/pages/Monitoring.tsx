@@ -264,15 +264,19 @@ export function Monitoring() {
                 </div>
 
                 <div className="space-y-3">
-                  {selectedBehavior.behavior && Object.entries(selectedBehavior.behavior).map(([key, value]: [string, unknown]) => {
-                    const displayValue: string = value !== null && value !== undefined ? String(value) : '-';
-                    return (
-                      <div key={key} className="flex justify-between border-b pb-2">
-                        <span className="text-sm text-gray-500 capitalize">{key.replace('_', ' ')}</span>
-                        <span className="text-sm font-medium text-gray-900">{displayValue as React.ReactNode}</span>
-                      </div>
-                    );
-                  })}
+                  {(() => {
+                    const behavior = selectedBehavior.behavior as Record<string, unknown> | undefined;
+                    if (!behavior) return null;
+                    return Object.entries(behavior).map(([key, value]) => {
+                      const displayValue = value !== null && value !== undefined ? String(value) : '-';
+                      return (
+                        <div key={key} className="flex justify-between border-b pb-2">
+                          <span className="text-sm text-gray-500 capitalize">{key.replace(/_/g, ' ')}</span>
+                          <span className="text-sm font-medium text-gray-900">{displayValue}</span>
+                        </div>
+                      );
+                    });
+                  })()}
 
                   {(selectedBehavior as ResourceExtended).vm_size && (
                     <div className="flex justify-between border-b pb-2">
