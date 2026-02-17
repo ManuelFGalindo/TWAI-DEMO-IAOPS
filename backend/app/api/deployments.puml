@@ -13,6 +13,9 @@ class DeploymentRequest {
   HTTPException(status_code=500, detail=message): raise
   HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e): raise
   get_deployment_history(str, Depends(get_db): def
+  AppServiceRequest(BaseModel): class
+  create_app_service(AppServiceRequest, Depends(get_db): def
+  HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e): raise
   _extract_resource_name(str): def
   _extract_resource_group(str): def
 }

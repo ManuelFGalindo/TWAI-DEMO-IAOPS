@@ -3,6 +3,7 @@ Orquestador de IA para generación de soluciones y arquitecturas
 """
 from typing import Dict, Any, List, Optional
 import json
+import re
 from app.core.logging import logger
 from app.core.config import settings
 from app.models.schemas import Client, ArchitectureRequest, CloudProvider, ArchitectureResponse
@@ -14,7 +15,7 @@ class AIOrchestrator:
     
     Responsable de:
     - Generar arquitecturas respetando el tech profile del cliente
-    - Generar código de infraestructura (Terraform, CloudFormation, ARM)
+    - Generar código de infraestructura (Terraform, CloudFormation, ARM/Bicep)
     - Generar pipelines de CI/CD automáticamente
     - Diseñar soluciones alineadas a las tecnologías del cliente
     - Estimar costos
@@ -308,8 +309,12 @@ Genera SOLO el JSON, sin explicaciones adicionales.
         """
         Genera código de infraestructura basado en la arquitectura
         """
+        # Si no se especifica, usar Bicep por defecto para Azure (más simple que ARM)
         if not infrastructure_standard:
             infrastructure_standard = client.tech_profile.standards.infrastructure
+        
+        # ARM templates work better with Azure CLI - no conversion needed
+        # El código ARM (JSON) se despliega directamente sin problemas
         
         prompt = f"""
 Genera código de infraestructura usando {infrastructure_standard} para la siguiente arquitectura:
@@ -318,44 +323,107 @@ Genera código de infraestructura usando {infrastructure_standard} para la sigui
 
 Clouds a usar: {', '.join(client.tech_profile.clouds)}
 
-Reglas CRÍTICAS:
-1. Genera código COMPLETO y funcional.
-2. IMPORTANTE para Azure/Bicep/ARM: 
-   - NO incluyas el recurso 'Microsoft.Resources/resourceGroups'.
-   - REGLAS DE ESQUEMA Y NOMENCLATURA (Azure):
-      * 'Microsoft.Network/publicIPAddresses': El 'sku' (ej: {{ 'name': 'Standard' }}) DEBE ir al mismo nivel que 'name' y 'type', NUNCA dentro de 'properties'.
-      * 'Microsoft.Compute/disks': Usa la API version '2021-08-01' o superior (la version '2021-03-01' es inválida).
-      * 'Microsoft.Compute/virtualMachines': Para cada disco en 'dataDisks', DEBES asignar un 'lun' ÚNICO (empezando en 0).
-      * 'Microsoft.Network/networkInterfaces': El 'networkSecurityGroup' DEBE ir en 'properties' del NIC, NUNCA dentro de 'ipConfigurations'.
-      * PARA SUBREDES (ARM): Al usar `resourceId('Microsoft.Network/virtualNetworks/subnets', ...)`, DEBES pasar DOS argumentos de nombre: primero el nombre de la VNET y luego el de la SUBRED.
-      * 'Microsoft.Storage/storageAccounts': Usa la API version '2021-09-01' (la versión '2020-06-01' es inválida). El nombre debe tener entre 3 y 24 caracteres, SOLO letras minúsculas y números.
-      * CONSISTENCIA DE NOMBRES: Asegura que el nombre usado en 'resourceId' o referencias coincida EXACTAMENTE con el 'name' definido para ese recurso.
-      * PARA ARM TEMPLATES (JSON): NO uses la sección 'parameters' ni la propiedad 'provider' (causan errores de deserialización). Hardcodea valores directamente en 'resources'.
-      * PARA OUTPUTS (ARM): Usa strings hardcodeados para nombres (ej: 'value': 'pstorage001').
-      * 'Microsoft.Compute/disks': usa 'sku': {{ 'name': 'Standard_LRS' }} en lugar de 'properties.accountType'.
-      * 'Microsoft.ContainerService/managedClusters': Usa 'apiVersion': '2024-01-01' (o más reciente).
-      * 'Microsoft.ContainerService/managedClusters': Usa 'kubernetesVersion': '1.29.0'.
-      * 'Microsoft.ContainerService/managedClusters': Usa 'identity': {{ 'type': 'SystemAssigned' }} y OMITES COMPLETAMENTE 'servicePrincipalProfile'.
-      * 'Microsoft.ContainerService/managedClusters': En 'agentPoolProfiles', asegúrate de que el primer pool tenga 'mode': 'System' y 'name': 'agentpool'.
-      * 'Microsoft.ContainerService/managedClusters': DEBES incluir 'dnsPrefix': 'aks-dns' (o similar). NO puede estar vacío.
-      * 'Microsoft.Web/sites': Asegura que 'serverFarmId' esté dentro de 'properties'.
-      * 'Microsoft.Web/sites': DEBE incluir 'dependsOn': ['[resourceId(''Microsoft.Web/serverfarms'', ''nombre_del_plan'')]'] (reemplaza 'nombre_del_plan' por el nombre real).
-      * 'Microsoft.ContainerService/managedClusters': DEBES incluir 'dnsPrefix': 'aks-dns' (o similar). NO puede estar vacío.
-      * 'Microsoft.Web/sites': Asegura que 'serverFarmId' esté dentro de 'properties'.
-      * 'Microsoft.Web/sites': DEBE incluir 'dependsOn': ['[resourceId(''Microsoft.Web/serverfarms'', ''nombre_del_plan'')]'] (reemplaza 'nombre_del_plan' por el nombre real).
-      * 'Microsoft.Web/sites': Para 'siteConfig.linuxFxVersion', usa SOLO versiones LTS recientes: 'NODE|18-lts', 'PYTHON|3.11', 'DOTNETCORE|7.0'. NO USES versiones antiguas.
-      * 'Microsoft.Web/sites': El 'name' NO puede contener guiones bajos ('_'). Usa guiones medios ('-').
-      * 'Microsoft.Web/serverfarms': Usa 'sku': {{ 'name': 'S1', 'tier': 'Standard' }} (o acorde a lo pedido).
-      * PARA CUALQUIER RECURSO: Usa versiones de API estables y recientes (ej: 2021+ para Compute/Storage, 2023+ para Contenedores). NO uses versiones 'preview' a menos que sea estrictamente necesario.
-      * IMPORTANTE: Genera SOLO los recursos solicitados por el usuario. NO agregues clusters de Kubernetes (AKS) si el usuario pidió solo una VM, Storage o App Service.
-      * Asegura que todas las propiedades sigan el esquema oficial de Azure ARM/Bicep vigente.
-   - REGLAS DE SEGURIDAD Y SANITIZACIÓN:
-     * 'adminUsername': ELIMINA cualquier '@' o punto. Si el usuario pide 'admin@peribank.com', usa 'adminperibank'. Máximo 20 caracteres.
-     * 'adminPassword': DEBE ser hardcodeada y compleja (ej: 'IaOps.2026.Deploy!'), ignorando si el usuario provee una débil como '12345'.
-   - Asegura que todos los recursos dependientes estén EXPLICITAMENTE definidos y usa 'dependsOn' correctamente.
-   - Asegura que todos los recursos referenciados en 'outputs' o propiedades existan en el bloque 'resources'.
-3. Si es Terraform, incluye provider configuration y resource group con el nombre '{architecture.get('resource_group_name', 'iaops-rg')}'.
-4. Incluye outputs útiles (IPs, nombres de recursos).
+## REGLAS CRÍTICAS DE AZURE (ARM Templates JSON):
+
+1. GENERAL:
+    - NO incluyas el recurso 'Microsoft.Resources/resourceGroups'.
+    - **UBICACIÓN: Usa solo 'eastus' o 'westus2' (sin espacios, minúsculas).**
+    - **API VERSIONS - Usa SOLO estas versiones probadas:**
+      - Microsoft.Web/serverFarms: '2022-09-01' (NO usar 2023+)
+      - Microsoft.Web/sites: '2022-09-01'
+      - Microsoft.Compute/virtualMachines: '2021-03-01'
+      - Microsoft.Compute/disks: '2021-04-01' (NO usar 2021-08-01)
+      - Microsoft.Network/virtualNetworks: '2021-03-01'
+      - Microsoft.Network/publicIPAddresses: '2021-03-01'
+      - Microsoft.Network/networkInterfaces: '2021-03-01'
+      - Microsoft.Storage/storageAccounts: '2021-04-01'
+    - HARDCODEA valores directamente en la sección 'resources'. NO uses 'parameters' ni 'variables' en el JSON final para evitar errores de deserialización.
+    - **Usa formato JSON estándar con comillas dobles (").**
+
+2. MICROSOFT.WEB/SITES (App Service):
+    - 'name': NO puede contener guiones bajos (_). Usa solo guiones medios (-).
+    - 'kind': SIEMPRE usar 'app,linux' para Linux (con coma, NO con espacios)
+    - 'properties.serverFarmId': Debe estar dentro de 'properties'.
+    - 'dependsOn': DEBE incluir explícitamente el resourceId del App Service Plan.
+    - 'siteConfig.linuxFxVersion' (CRÍTICO): Usa solo formatos con pipe (|). Valores permitidos: 'NODE|20-lts', 'PYTHON|3.11', 'DOTNETCORE|8.0', 'JAVA|17-java17'.
+    - **IMPORTANTE: Si necesitas un App Service (Microsoft.Web/sites), DEBES crear primero el App Service Plan (Microsoft.Web/serverFarms) en el mismo template.**
+    - **EJEMPLO CORRECTO:**
+      {{
+        "type": "Microsoft.Web/sites",
+        "apiVersion": "2022-09-01",
+        "name": "peribank-mobile",
+        "location": "eastus",
+        "kind": "app,linux",
+        "dependsOn": ["[resourceId('Microsoft.Web/serverFarms', 'peribank-mobile-plan')]"],
+        "properties": {{
+          "serverFarmId": "[resourceId('Microsoft.Web/serverFarms', 'peribank-mobile-plan')]",
+          "siteConfig": {{
+            "linuxFxVersion": "PYTHON|3.11"
+          }}
+        }}
+      }}
+
+3. MICROSOFT.WEB/SERVERFARMS (App Service Plan):
+    - **NUNCA usar 'computeMode' en las propiedades.**
+    - Para Linux: 'kind': 'linux' y agregar 'reserved': true
+    - Para Windows: 'kind': 'windows'
+    - **EJEMPLO CORRECTO:**
+      {{
+        "type": "Microsoft.Web/serverFarms",
+        "apiVersion": "2022-09-01",
+        "name": "peribank-mobile-plan",
+        "location": "eastus",
+        "kind": "linux",
+        "sku": {{ "name": "F1", "tier": "Free" }},
+        "properties": {{ "reserved": true }}
+      }}
+
+3. MICROSOFT.WEB/SERVERFARMS (App Service Plan):
+    - **NUNCA usar 'computeMode' en las propiedades.**
+    - Para Linux: sku.tier = 'Basic', sku.name = 'B1', kind = 'linux'
+    - Para Windows: sku.tier = 'Basic', sku.name = 'B1', kind = 'windows'
+    - **NO incluir reserved para Linux si no es necesario.**
+
+4. MICROSOFT.WEB/SITES (Azure Functions):
+    - tipo = 'functionapp'
+    - **NO usar serverFarmId** - usar el plan de consumo o el app service plan directamente.
+    - Para Functions Linux: 'kind': 'functionapp,linux'
+    - Para Functions Windows: 'kind': 'functionapp'
+    - **NO especificar computeMode en el siteConfig.**
+
+3. MICROSOFT.COMPUTE (VMs & Disks):
+    - 'disks': Usa apiVersion '2021-04-01'. Usa 'sku': {{ 'name': 'Standard_LRS' }} (nunca properties.accountType).
+    - 'virtualMachines': Cada disco en 'dataDisks' DEBE tener un 'lun' único empezando en 0.
+    - 'adminUsername': Sin '@' ni puntos. Máximo 20 caracteres.
+    - 'adminPassword': Usa siempre 'IaOps.2026.Deploy!'.
+
+4. MICROSOFT.NETWORK:
+    - 'publicIPAddresses': El 'sku': {{ 'name': 'Standard' }} debe estar al mismo nivel que 'name' y 'type' (FUERA de properties).
+    - 'networkInterfaces': El 'networkSecurityGroup' debe ir en la raíz de 'properties' del NIC, NO en 'ipConfigurations'.
+    - SUBREDES: Al usar resourceId para subnets, pasa SIEMPRE 2 argumentos: [VNET_Name, Subnet_Name].
+
+5. MICROSOFT.CONTAINERSERVICE (AKS):
+    - apiVersion: '2024-01-01'.
+    - 'kubernetesVersion': '1.29.0'.
+    - 'dnsPrefix': Debe ser 'aks-dns' o similar (no puede estar vacío).
+    - 'identity': Usa {{ 'type': 'SystemAssigned' }}. OMITIR 'servicePrincipalProfile'.
+    - 'agentPoolProfiles': El primero debe ser name: 'agentpool' y mode: 'System'.
+
+6. MICROSOFT.STORAGE:
+    - apiVersion: '2021-09-01'.
+    - Nombre: 3-24 caracteres, solo minúsculas y números.
+
+7. MICROSOFT.LOGIC/WORKFLOWS (Logic Apps):
+    - apiVersion: '2019-05-01' (NO usar versiones más recientes).
+    - DEFINICIÓN: Usa 'definition' en la raíz, NO en 'properties.definition'.
+
+8. MICROSOFT.WEB/CONNECTIONS (API Connections):
+    - CRÍTICO: NO uses este recurso. Si necesitas una conexión, créala manualmente en el portal o usa Managed Identity.
+    - Este recurso tiene apiVersions limitadas (2015-08-01-preview a 2018-07-01-preview) y no está disponible en todas las ubicaciones.
+
+## REGLAS DE SEGURIDAD Y FORMATO:
+- Si es Terraform, incluye provider configuration y el resource group '{architecture.get('resource_group_name', 'iaops-rg')}'.
+- Retorna SOLO el código. NO incluyas bloques de markdown (```), ni explicaciones, ni comentarios.
 
 Retorna SOLO el código, sin explicaciones ni markdown.
 """

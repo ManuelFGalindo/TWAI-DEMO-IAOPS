@@ -52,7 +52,12 @@ class IAOPSOrchestrator:
             if provider == CloudProvider.AWS:
                 connector = AWSConnector(credentials, region)
             elif provider == CloudProvider.AZURE:
-                connector = AzureConnector(credentials, region)
+                connector = AzureConnector(
+                    subscription_id=credentials.get('subscription_id', ''),
+                    tenant_id=credentials.get('tenant_id', ''),
+                    client_id=credentials.get('client_id', ''),
+                    client_secret=credentials.get('client_secret', '')
+                )
             elif provider == CloudProvider.GCP:
                 connector = GCPConnector(credentials, region)
             else:

@@ -281,6 +281,43 @@ async def get_deployment_history(client_id: str, db: AsyncSession = Depends(get_
     return history
 
 
+class AppServiceRequest(BaseModel):
+    """Request para crear un App Service"""
+    resource_group: str = "rg_iop"
+    app_service_name: str
+    app_service_plan_name: Optional[str] = None
+    location: str = "eastus"
+    runtime: str = "PYTHON|3.11"
+
+
+@router.post("/app-service")
+async def create_app_service(request: AppServiceRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Crea un App Service directamente en Azure (sin usar ARM Template)
+    """
+    from app.connectors.cloud.azure_connector import get_azure_connector
+    
+    try:
+        azure_connector = get_azure_connector()
+        
+        result = await azure_connector.create_app_service(
+            resource_group=request.resource_group,
+            app_service_name=request.app_service_name,
+            app_service_plan_name=request.app_service_plan_name,
+            location=request.location,
+            runtime=request.runtime
+        )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error creating App Service: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
 def _extract_resource_name(resource_id: str) -> str:
     """
     Extrae el nombre del recurso desde un Azure Resource ID

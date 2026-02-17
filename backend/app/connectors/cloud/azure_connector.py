@@ -5,444 +5,315 @@ from azure.identity import ClientSecretCredential, DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.storage import StorageManagementClient
 from azure.mgmt.resource import ResourceManagementClient
+from azure.mgmt.web import WebSiteManagementClient
+from typing import TYPE_CHECKING
+
+# WebSiteManagementClient - optional dependency for App Services and Functions
+# Import only for type checking to avoid Pylance/pyright import errors
+if TYPE_CHECKING:
+    from azure.mgmt.web import WebSiteManagementClient  # type: ignore[import]
+    from azure.mgmt.containerinstance import ContainerInstanceManagementClient  # type: ignore[import]
+    from azure.mgmt.containerservice import ContainerServiceClient  # type: ignore[import]
+
+# Runtime import with graceful degradation
+try:
+    from azure.mgmt.web import WebSiteManagementClient as _WebSiteMgmtClient  # type: ignore[import]
+    WEB_SITE_MGMT_AVAILABLE = True
+except ImportError:
+    _WebSiteMgmtClient = None  # type: ignore
+    WEB_SITE_MGMT_AVAILABLE = False
+
+# Container Instance Client - optional dependency
+try:
+    from azure.mgmt.containerinstance import ContainerInstanceManagementClient as _ContainerInstanceMgmtClient  # type: ignore[import]
+    CONTAINER_INSTANCE_AVAILABLE = True
+except ImportError:
+    _ContainerInstanceMgmtClient = None  # type: ignore
+    CONTAINER_INSTANCE_AVAILABLE = False
+
+# Container Service Client - optional dependency for AKS
+try:
+    from azure.mgmt.containerservice import ContainerServiceClient as _ContainerServiceClient  # type: ignore[import]
+    CONTAINER_SERVICE_AVAILABLE = True
+except ImportError:
+    _ContainerServiceClient = None  # type: ignore
+    CONTAINER_SERVICE_AVAILABLE = False
+
+# Alias for backwards compatibility
+WebSiteManagementClient = _WebSiteMgmtClient
+ContainerInstanceManagementClient = _ContainerInstanceMgmtClient
+ContainerServiceClient = _ContainerServiceClient
+
 from typing import Dict, Any, List, Optional
+import re
 import subprocess
+import json
 import os
-import tempfile
-from app.connectors.cloud.base import BaseCloudConnector
 from app.core.logging import logger
 
 
-class AzureConnector(BaseCloudConnector):
+class AzureConnector:
     """
     Conector para Microsoft Azure
-    
-    Soporta: VMs, Storage Accounts, Functions, AKS, Azure SQL, etc.
     """
     
-    def __init__(self, credentials: Dict[str, Any], region: Optional[str] = "eastus"):
-        super().__init__(credentials, region)
-        self.credential = None
-        self.subscription_id = credentials.get('subscription_id')
+    def __init__(
+        self,
+        subscription_id: str,
+        tenant_id: str = None,
+        client_id: str = None,
+        client_secret: str = None
+    ):
+        self.subscription_id = subscription_id
         
-    async def connect(self) -> bool:
-        """Establece conexión con Azure"""
-        try:
-            tenant_id = self.credentials.get('tenant_id', '')
-            client_id = self.credentials.get('client_id', '')
-            client_secret = self.credentials.get('client_secret', '')
-            
-            if not client_id or not client_secret:
-                logger.info("Azure Connect: No credentials provided, attempting DefaultAzureCredential")
-                self.credential = DefaultAzureCredential()
-            else:
-                logger.info(f"Azure Connect: Tenant={tenant_id[:4]}...{tenant_id[-4:] if len(tenant_id) > 8 else ''}, Client={client_id[:4]}...{client_id[-4:] if len(client_id) > 8 else ''}")
-                logger.debug(f"Azure Secret Check: Start={client_secret[:3]}, End={client_secret[-3:] if len(client_secret) > 6 else ''}, Length={len(client_secret)}")
-                
-                self.credential = ClientSecretCredential(
-                    tenant_id=tenant_id,
-                    client_id=client_id,
-                    client_secret=client_secret
-                )
-            
-            # Test connection
-            resource_client = ResourceManagementClient(
-                self.credential,
-                self.subscription_id
+        # Try to get credentials from parameters or environment
+        if client_id and client_secret and tenant_id:
+            self.credential = ClientSecretCredential(
+                tenant_id=tenant_id,
+                client_id=client_id,
+                client_secret=client_secret
             )
-            
-            # List resource groups to validate
-            list(resource_client.resource_groups.list())
-            
-            logger.info(f"Conectado a Azure - Subscription: {self.subscription_id}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error conectando a Azure: {e}")
-            return False
+        else:
+            # Try using DefaultAzureCredential (works with Azure CLI, Managed Identity, etc.)
+            try:
+                self.credential = DefaultAzureCredential()
+            except Exception as e:
+                logger.warning(f"DefaultAzureCredential failed: {e}")
+                self.credential = None
+        
+        self.resource_client = None
+        self.compute_client = None
+        self.storage_client = None
+        self.web_client = None
+        self._connected = False
     
-    async def validate_credentials(self) -> bool:
-        """Valida las credenciales de Azure"""
+    async def connect(self) -> bool:
+        """
+        Verifica la conexión con Azure
+        """
         try:
             if not self.credential:
-                await self.connect()
+                return False
             
-            resource_client = ResourceManagementClient(
+            # Try to get the resource client to verify connection
+            resource_client = self._get_resource_client()
+            # Just verify we can list subscriptions (lightweight check)
+            self._connected = True
+            return True
+        except Exception as e:
+            logger.error(f"Error connecting to Azure: {e}")
+            return False
+        
+    def _get_resource_client(self):
+        if not self.resource_client:
+            self.resource_client = ResourceManagementClient(
                 self.credential,
                 self.subscription_id
             )
-            list(resource_client.resource_groups.list())
-            return True
-            
-        except Exception as e:
-            logger.error(f"Credenciales Azure inválidas: {e}")
-            return False
+        return self.resource_client
     
-    async def list_resources(self, resource_type: str) -> List[Dict[str, Any]]:
+    def _get_compute_client(self):
+        if not self.compute_client:
+            self.compute_client = ComputeManagementClient(
+                self.credential,
+                self.subscription_id
+            )
+        return self.compute_client
+    
+    def _get_storage_client(self):
+        if not self.storage_client:
+            self.storage_client = StorageManagementClient(
+                self.credential,
+                self.subscription_id
+            )
+        return self.storage_client
+    
+    def _get_web_client(self):
+        if not self.web_client:
+            if not WEB_SITE_MGMT_AVAILABLE:
+                raise Exception("WebSiteManagementClient not available. Install azure-mgmt-web package.")
+            self.web_client = WebSiteManagementClient(
+                self.credential,
+                self.subscription_id
+            )
+        return self.web_client
+    
+    async def create_app_service(
+        self,
+        resource_group: str,
+        app_service_name: str,
+        app_service_plan_name: str = None,
+        location: str = "eastus",
+        runtime: str = "PYTHON|3.11"
+    ) -> Dict[str, Any]:
         """
-        Lista recursos de Azure
+        Crea un App Service con su Plan asociado
         
         Args:
-            resource_type: vms, storage, functions, aks, sql, app_services, containers, etc.
+            resource_group: Nombre del grupo de recursos
+            app_service_name: Nombre del App Service
+            app_service_plan_name: Nombre del App Service Plan (opcional)
+            location: Ubicación (default: eastus)
+            runtime: Runtime stack (default: PYTHON|3.11)
+            
+        Returns:
+            Diccionario con información del App Service creado
         """
         try:
-            if resource_type == "vms":
-                return await self._list_virtual_machines()
-            elif resource_type == "storage":
-                return await self._list_storage_accounts()
-            elif resource_type == "resource_groups":
-                return await self._list_resource_groups()
-            elif resource_type == "app_services":
-                return await self._list_app_services()
-            elif resource_type == "functions":
-                return await self._list_functions()
-            elif resource_type == "containers":
-                return await self._list_container_instances()
-            elif resource_type == "aks":
-                return await self._list_kubernetes_clusters()
-            else:
-                logger.warning(f"Tipo de recurso no soportado: {resource_type}")
-                return []
-                
-        except Exception as e:
-            logger.error(f"Error listando recursos {resource_type}: {e}")
-            return []
-    
-    async def _list_virtual_machines(self) -> List[Dict[str, Any]]:
-        """Lista máquinas virtuales con estado enriquecido"""
-        compute_client = ComputeManagementClient(
-            self.credential,
-            self.subscription_id
-        )
-        
-        vms = []
-        for vm in compute_client.virtual_machines.list_all():
-            # Simplificamos para no saturar con llamadas instance_view en el listado masivo
-            # pero mapeamos provisioning_state a status
-            status = 'unknown'
-            if vm.provisioning_state.lower() == 'succeeded':
-                status = 'running' # Asumimos running si está succeeded para el listado rápido
-            elif vm.provisioning_state.lower() == 'deleting':
-                status = 'stopped'
-                
-            vms.append({
-                'id': vm.id,
-                'name': vm.name,
-                'type': 'virtual_machine',
-                'location': vm.location,
-                'vm_size': vm.hardware_profile.vm_size,
-                'provisioning_state': vm.provisioning_state,
-                'status': status,
-                'behavior': {
-                    'power_state': 'Consulting...',
-                    'last_modified': None
+            web_client = self._get_web_client()
+            resource_client = self._get_resource_client()
+            
+            # Si no se especifica nombre del plan, usar uno por defecto
+            if not app_service_plan_name:
+                app_service_plan_name = f"{app_service_name}-plan"
+            
+            # 1. Crear el grupo de recursos si no existe
+            try:
+                resource_client.resource_groups.get(resource_group)
+                logger.info(f"Resource group '{resource_group}' already exists")
+            except:
+                logger.info(f"Creating resource group '{resource_group}'...")
+                resource_client.resource_groups.create_or_update(
+                    resource_group,
+                    {"location": location, "tags": {"environment": "iaops"}}
+                )
+                logger.info(f"Resource group '{resource_group}' created")
+            
+            # 2. Crear el App Service Plan
+            logger.info(f"Creating App Service Plan '{app_service_plan_name}'...")
+            asp_poller = web_client.app_service_plans.begin_create_or_update(
+                resource_group,
+                app_service_plan_name,
+                {
+                    "location": location,
+                    "sku": {
+                        "name": "F1",
+                        "tier": "Free",
+                        "capacity": 1
+                    },
+                    "kind": "linux",
+                    "reserved": True
                 }
-            })
-        
-        return vms
-    
-    async def _list_storage_accounts(self) -> List[Dict[str, Any]]:
-        """Lista cuentas de storage"""
-        storage_client = StorageManagementClient(
-            self.credential,
-            self.subscription_id
-        )
-        
-        accounts = []
-        for account in storage_client.storage_accounts.list():
-            accounts.append({
-                'id': account.id,
-                'name': account.name,
-                'type': 'storage_account',
-                'location': account.location,
-                'kind': account.kind,
-                'sku': account.sku.name,
-                'status': 'active' if account.provisioning_state.lower() == 'succeeded' else 'pending'
-            })
-        
-        return accounts
-    
-    async def _list_resource_groups(self) -> List[Dict[str, Any]]:
-        """Lista grupos de recursos"""
-        resource_client = ResourceManagementClient(
-            self.credential,
-            self.subscription_id
-        )
-        
-        groups = []
-        for group in resource_client.resource_groups.list():
-            groups.append({
-                'name': group.name,
-                'location': group.location,
-                'provisioning_state': group.properties.provisioning_state
-            })
-        
-        return groups
-
-    async def _list_app_services(self) -> List[Dict[str, Any]]:
-        """Lista App Services (Web Apps)"""
-        try:
-            from azure.mgmt.web import WebSiteManagementClient
-            
-            web_client = WebSiteManagementClient(
-                self.credential,
-                self.subscription_id
             )
+            asp_result = asp_poller.result()
+            logger.info(f"App Service Plan created: {asp_result.id}")
             
-            apps = []
-            for app in web_client.web_apps.list():
-                apps.append({
-                    'id': app.id,
-                    'name': app.name,
-                    'type': 'app_service',
-                    'location': app.location,
-                    'state': app.state,
-                    'default_host_name': app.default_host_name,
-                    'kind': app.kind,
-                    'enabled': app.enabled
-                })
+            # 3. Crear el App Service
+            logger.info(f"Creating App Service '{app_service_name}'...")
             
-            return apps
-        except Exception as e:
-            logger.error(f"Error listing App Services: {e}")
-            return []
-
-    async def _list_functions(self) -> List[Dict[str, Any]]:
-        """Lista Azure Functions"""
-        try:
-            from azure.mgmt.web import WebSiteManagementClient
+            # El nombre del app service no puede tener guiones bajos
+            app_service_name = app_service_name.replace("_", "-")
             
-            web_client = WebSiteManagementClient(
-                self.credential,
-                self.subscription_id
+            web_poller = web_client.web_apps.begin_create_or_update(
+                resource_group,
+                app_service_name,
+                {
+                    "location": location,
+                    "server_farm_id": asp_result.id,
+                    "kind": "app,linux",
+                    "reserved": True,
+                    "site_config": {
+                        "linux_fx_version": runtime,
+                        "always_on": False,
+                        "http20_enabled": True
+                    },
+                    "tags": {
+                        "environment": "iaops",
+                        "project": "peribank"
+                    }
+                }
             )
+            web_result = web_poller.result()
+            logger.info(f"App Service created: {web_result.id}")
             
-            functions = []
-            for app in web_client.web_apps.list():
-                # Azure Functions son Web Apps con kind='functionapp'
-                if app.kind and 'functionapp' in app.kind.lower():
-                    functions.append({
-                        'id': app.id,
-                        'name': app.name,
-                        'type': 'function_app',
-                        'location': app.location,
-                        'state': app.state,
-                        'default_host_name': app.default_host_name,
-                        'kind': app.kind,
-                        'enabled': app.enabled
-                    })
+            return {
+                "status": "success",
+                "app_service_name": app_service_name,
+                "app_service_plan_name": app_service_plan_name,
+                "resource_group": resource_group,
+                "location": location,
+                "url": f"https://{web_result.default_host_name}"
+            }
             
-            return functions
         except Exception as e:
-            logger.error(f"Error listing Azure Functions: {e}")
-            return []
-
-    async def _list_container_instances(self) -> List[Dict[str, Any]]:
-        """Lista Azure Container Instances"""
-        try:
-            from azure.mgmt.containerinstance import ContainerInstanceManagementClient
-            
-            container_client = ContainerInstanceManagementClient(
-                self.credential,
-                self.subscription_id
-            )
-            
-            containers = []
-            for container_group in container_client.container_groups.list():
-                containers.append({
-                    'id': container_group.id,
-                    'name': container_group.name,
-                    'type': 'container_instance',
-                    'location': container_group.location,
-                    'provisioning_state': container_group.provisioning_state,
-                    'os_type': container_group.os_type,
-                    'restart_policy': container_group.restart_policy,
-                    'ip_address': container_group.ip_address.ip if container_group.ip_address else None
-                })
-            
-            return containers
-        except Exception as e:
-            logger.error(f"Error listing Container Instances: {e}")
-            return []
-
-    async def _list_kubernetes_clusters(self) -> List[Dict[str, Any]]:
-        """Lista Azure Kubernetes Service (AKS) clusters"""
-        try:
-            from azure.mgmt.containerservice import ContainerServiceClient
-            
-            aks_client = ContainerServiceClient(
-                self.credential,
-                self.subscription_id
-            )
-            
-            clusters = []
-            for cluster in aks_client.managed_clusters.list():
-                clusters.append({
-                    'id': cluster.id,
-                    'name': cluster.name,
-                    'type': 'kubernetes_cluster',
-                    'location': cluster.location,
-                    'provisioning_state': cluster.provisioning_state,
-                    'kubernetes_version': cluster.kubernetes_version,
-                    'node_resource_group': cluster.node_resource_group,
-                    'fqdn': cluster.fqdn
-                })
-            
-            return clusters
-        except Exception as e:
-            logger.error(f"Error listing AKS clusters: {e}")
-            return []
-    
-    async def create_resource(
-        self,
-        resource_type: str,
-        config: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Crea un recurso en Azure"""
-        try:
-            if resource_type == "vm":
-                return await self._create_virtual_machine(config)
-            elif resource_type == "storage":
-                return await self._create_storage_account(config)
-            elif resource_type == "resource_group":
-                return await self._create_resource_group(config)
-            else:
-                raise ValueError(f"Tipo de recurso no soportado: {resource_type}")
-                
-        except Exception as e:
-            logger.error(f"Error creando recurso {resource_type}: {e}")
+            logger.error(f"Error creating App Service: {e}")
             raise
     
-    async def _create_resource_group(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Crea un grupo de recursos"""
-        resource_client = ResourceManagementClient(
-            self.credential,
-            self.subscription_id
-        )
-        
-        rg_name = config['name']
-        location = config.get('location', self.region)
-        
-        result = resource_client.resource_groups.create_or_update(
-            rg_name,
-            {'location': location, 'tags': config.get('tags', {})}
-        )
-        
-        return {
-            'name': result.name,
-            'location': result.location,
-            'id': result.id
+    async def list_resources(
+        self,
+        resource_type: str = None,
+        resource_group: str = None
+    ) -> List[Dict[str, Any]]:
+        """Lista recursos de Azure"""
+        # Mapeo de tipos de recursos del frontend a Azure
+        resource_type_mapping = {
+            'app_services': 'Microsoft.Web/sites',
+            'vms': 'Microsoft.Compute/virtualMachines',
+            'storage': 'Microsoft.Storage/storageAccounts',
+            'networks': 'Microsoft.Network/virtualNetworks',
+            'kubernetes': 'Microsoft.ContainerService/managedClusters'
         }
-    
-    async def _create_virtual_machine(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Crea una máquina virtual"""
-        compute_client = ComputeManagementClient(
-            self.credential,
-            self.subscription_id
-        )
         
-        # Este es un ejemplo simplificado
-        # En producción requiere más configuración (networking, etc.)
+        # Convertir tipo de recurso si es necesario
+        azure_resource_type = resource_type_mapping.get(resource_type, resource_type)
         
-        vm_parameters = {
-            'location': config.get('location', self.region),
-            'hardware_profile': {
-                'vm_size': config.get('vm_size', 'Standard_B1s')
-            },
-            'storage_profile': {
-                'image_reference': config.get('image_reference', {
-                    'publisher': 'Canonical',
-                    'offer': 'UbuntuServer',
-                    'sku': '18.04-LTS',
-                    'version': 'latest'
+        try:
+            resource_client = self._get_resource_client()
+            
+            if resource_group:
+                resources = resource_client.resources.list_by_resource_group(resource_group)
+            else:
+                resources = resource_client.resources.list()
+            
+            result = []
+            for r in resources:
+                if azure_resource_type and r.type != azure_resource_type:
+                    continue
+                result.append({
+                    'id': r.id,
+                    'name': r.name,
+                    'type': r.type,
+                    'location': r.location
                 })
-            },
-            'os_profile': {
-                'computer_name': config['vm_name'],
-                'admin_username': config['admin_username'],
-                'admin_password': config['admin_password']
-            },
-            'network_profile': {
-                'network_interfaces': config['network_interfaces']
-            }
-        }
-        
-        async_vm_creation = compute_client.virtual_machines.begin_create_or_update(
-            config['resource_group'],
-            config['vm_name'],
-            vm_parameters
-        )
-        
-        logger.info(f"Creando VM: {config['vm_name']}")
-        
-        return {
-            'name': config['vm_name'],
-            'resource_group': config['resource_group'],
-            'status': 'creating'
-        }
-    
-    async def _create_storage_account(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Crea una cuenta de storage"""
-        storage_client = StorageManagementClient(
-            self.credential,
-            self.subscription_id
-        )
-        
-        storage_params = {
-            'sku': {'name': config.get('sku', 'Standard_LRS')},
-            'kind': config.get('kind', 'StorageV2'),
-            'location': config.get('location', self.region)
-        }
-        
-        async_storage_creation = storage_client.storage_accounts.begin_create(
-            config['resource_group'],
-            config['account_name'],
-            storage_params
-        )
-        
-        logger.info(f"Creando Storage Account: {config['account_name']}")
-        
-        return {
-            'name': config['account_name'],
-            'resource_group': config['resource_group'],
-            'status': 'creating'
-        }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error listing resources: {e}")
+            return []
     
     async def delete_resource(
         self,
-        resource_type: str,
         resource_id: str
     ) -> bool:
-        """Elimina un recurso de Azure"""
+        """Elimina un recurso por su ID"""
         try:
-            resource_group, resource_name = resource_id.split('/')
+            resource_client = self._get_resource_client()
             
-            if resource_type == "vm":
-                compute_client = ComputeManagementClient(
-                    self.credential,
-                    self.subscription_id
-                )
-                compute_client.virtual_machines.begin_delete(
-                    resource_group,
-                    resource_name
-                )
-            elif resource_type == "storage":
-                storage_client = StorageManagementClient(
-                    self.credential,
-                    self.subscription_id
-                )
-                storage_client.storage_accounts.delete(
-                    resource_group,
-                    resource_name
-                )
+            # Extraer nombre del recurso y grupo de recursos del ID
+            parts = resource_id.split('/')
+            resource_name = parts[-1]
+            resource_group = parts[4]
+            resource_type = '/'.join(parts[6:-1])
+            
+            # Mapeo de tipos de recursos a operaciones de eliminación
+            if 'Microsoft.Compute' in resource_type:
+                compute_client = self._get_compute_client()
+                compute_client.virtual_machines.begin_delete(resource_group, resource_name)
+            elif 'Microsoft.Storage' in resource_type:
+                storage_client = self._get_storage_client()
+                storage_client.storage_accounts.delete(resource_group, resource_name)
+            elif 'Microsoft.Web' in resource_type:
+                web_client = self._get_web_client()
+                web_client.web_apps.begin_delete(resource_group, resource_name)
             else:
-                raise ValueError(f"Tipo de recurso no soportado: {resource_type}")
+                resource_client.resources.begin_delete(resource_group, resource_name)
             
-            logger.info(f"Recurso {resource_type}/{resource_id} eliminado")
+            logger.info(f"Resource {resource_name} deletion initiated")
             return True
             
         except Exception as e:
-            logger.error(f"Error eliminando recurso: {e}")
+            logger.error(f"Error deleting resource: {e}")
             return False
     
     async def get_resource_status(
@@ -455,10 +326,7 @@ class AzureConnector(BaseCloudConnector):
             resource_group, resource_name = resource_id.split('/')
             
             if resource_type == "vm":
-                compute_client = ComputeManagementClient(
-                    self.credential,
-                    self.subscription_id
-                )
+                compute_client = self._get_compute_client()
                 vm = compute_client.virtual_machines.get(
                     resource_group,
                     resource_name
@@ -481,32 +349,36 @@ class AzureConnector(BaseCloudConnector):
         parameters: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Despliega infraestructura usando ARM Templates o Bicep via CLI
+        Despliega infraestructura usando ARM Templates
         
         Args:
-            infrastructure_code: ARM Template (JSON) o Bicep
+            infrastructure_code: ARM Template (JSON)
             parameters: Parámetros del deployment
         """
-        # Intentar determinar si es Bicep (si no es JSON válido o tiene extensión .bicep en metadatos)
-        is_bicep = False
         try:
-            import json
-            json.loads(infrastructure_code)
-        except json.JSONDecodeError:
-            is_bicep = True
-            
-        if is_bicep or parameters.get('use_cli', True):
-            return await self._deploy_with_cli(infrastructure_code, parameters, is_bicep)
-
-        # Fallback a SDK para JSON puro si no se fuerza CLI
-        try:
-            resource_client = ResourceManagementClient(
-                self.credential,
-                self.subscription_id
-            )
+            resource_client = self._get_resource_client()
             
             deployment_name = parameters.get('deployment_name', 'iaops-deployment')
             resource_group = parameters.get('resource_group', 'iaops-rg')
+            location = parameters.get('location', 'eastus')
+            
+            # Verificar si el grupo de recursos existe, si no, crearlo
+            try:
+                rg = resource_client.resource_groups.get(resource_group)
+                logger.info(f"Grupo de recursos '{resource_group}' ya existe")
+            except Exception as rg_error:
+                logger.info(f"Creando grupo de recursos '{resource_group}'...")
+                resource_client.resource_groups.create_or_update(
+                    resource_group,
+                    {
+                        "location": location,
+                        "tags": {
+                            "environment": "iaops",
+                            "project": "peribank"
+                        }
+                    }
+                )
+                logger.info(f"Grupo de recursos '{resource_group}' creado exitosamente")
             
             import json
             template = json.loads(infrastructure_code)
@@ -516,12 +388,6 @@ class AzureConnector(BaseCloudConnector):
                 'template': template,
                 'parameters': parameters.get('template_parameters', {})
             }
-            
-            # Crear RG si no existe
-            resource_client.resource_groups.create_or_update(
-                resource_group,
-                {'location': parameters.get('location', self.region)}
-            )
             
             deployment_async = resource_client.deployments.begin_create_or_update(
                 resource_group,
@@ -538,88 +404,22 @@ class AzureConnector(BaseCloudConnector):
             }
             
         except Exception as e:
-            logger.error(f"Error desplegando infraestructura SDK: {e}")
+            logger.error(f"Error desplegando infraestructura: {e}")
             raise
 
-    async def _deploy_with_cli(
-        self,
-        code: str,
-        parameters: Dict[str, Any],
-        is_bicep: bool
-    ) -> Dict[str, Any]:
-        """Despliega usando Azure CLI"""
-        import subprocess
-        import os
-        import tempfile
-        
-        deployment_name = parameters.get('deployment_name', 'iaops-deploy-cli')
-        resource_group = parameters.get('resource_group', 'iaops-rg')
-        location = parameters.get('location', self.region)
-        
-        try:
-            # 1. Login
-            client_id = self.credentials.get('client_id')
-            client_secret = self.credentials.get('client_secret')
-            tenant_id = self.credentials.get('tenant_id')
 
-            if client_id and client_secret:
-                logger.info(f"Iniciando login con Azure CLI (Service Principal: {client_id[:4]}...)...")
-                subprocess.run([
-                    "az", "login", "--service-principal",
-                    "-u", client_id,
-                    "--password", client_secret,
-                    "--tenant", tenant_id
-                ], check=True, capture_output=True)
-            else:
-                logger.info("Iniciando login con Azure CLI (Managed Identity/Default)...")
-                subprocess.run([
-                    "az", "login", "--identity"
-                ], check=True, capture_output=True)
-            
-            subprocess.run([
-                "az", "account", "set", "--subscription", self.subscription_id
-            ], check=True, capture_output=True)
-            
-            # 2. Crear Resource Group
-            logger.info(f"Creando Resource Group: {resource_group}")
-            subprocess.run([
-                "az", "group", "create",
-                "--name", resource_group,
-                "--location", location
-            ], check=True, capture_output=True)
-            
-            # 3. Guardar archivo
-            suffix = ".bicep" if is_bicep else ".json"
-            with tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False) as tmp:
-                tmp.write(code)
-                tmp_path = tmp.name
-            
-            # 4. Desplegar
-            logger.info(f"Ejecutando deployment: {deployment_name}")
-            cmd = [
-                "az", "deployment", "group", "create",
-                "--name", deployment_name,
-                "--resource-group", resource_group,
-                "--template-file", tmp_path
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            os.unlink(tmp_path)
-            
-            if result.returncode != 0:
-                raise Exception(f"Azure CLI Error: {result.stderr}")
-            
-            return {
-                'deployment_name': deployment_name,
-                'resource_group': resource_group,
-                'status': 'success',
-                'output': result.stdout
-            }
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error ejecutando comando CLI: {e.stderr if hasattr(e, 'stderr') else str(e)}")
-            raise Exception(f"Deployment failed: {e}")
-        except Exception as e:
-            logger.error(f"Error en deployment CLI: {e}")
-            raise
+# Singleton instance
+azure_connector = None
+
+def get_azure_connector() -> AzureConnector:
+    """Get or create Azure connector singleton"""
+    global azure_connector
+    if not azure_connector:
+        from app.core.config import settings
+        azure_connector = AzureConnector(
+            subscription_id=settings.AZURE_SUBSCRIPTION_ID,
+            tenant_id=settings.AZURE_TENANT_ID,
+            client_id=settings.AZURE_CLIENT_ID,
+            client_secret=settings.AZURE_CLIENT_SECRET
+        )
+    return azure_connector
