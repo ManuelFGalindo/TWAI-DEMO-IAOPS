@@ -147,9 +147,53 @@ class GrafanaService:
         Returns:
             URL completa del dashboard
         """
-        # URL para embedding (kiosk mode)
-        return f"{self.public_url}/d/{dashboard_uid}?refresh={refresh}&kiosk=tv"
+        # URL para embedding con rango de tiempo explícito para evitar "invalid time range"
+        return f"{self.public_url}/d/{dashboard_uid}?from=now-6h&to=now&refresh={refresh}&kiosk=tv"
     
+    async def create_cloudwatch_datasource(
+        self,
+        name: str,
+        access_key_id: str,
+        secret_access_key: str,
+        session_token: Optional[str],
+        region: str = "us-east-1"
+    ) -> Dict[str, Any]:
+        """
+        Crea un datasource de AWS CloudWatch en Grafana
+        """
+        try:
+            datasource_config = {
+                "name": name,
+                "type": "cloudwatch",
+                "access": "proxy",
+                "jsonData": {
+                    "defaultRegion": region,
+                    "authType": "default",
+                    "assumeRoleArn": "",
+                    "externalId": ""
+                }
+            }
+
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/api/datasources",
+                    json=datasource_config,
+                    headers=self.headers,
+                    timeout=10.0
+                )
+                if response.status_code in [200, 201]:
+                    logger.info(f"CloudWatch datasource {name} creado exitosamente")
+                    return response.json()
+                elif response.status_code == 409:
+                    logger.warning(f"CloudWatch datasource {name} ya existe")
+                    return {"status": "exists", "name": name}
+                else:
+                    logger.error(f"Error creando CloudWatch datasource: {response.status_code} - {response.text}")
+                    raise Exception(f"Error creando CloudWatch datasource: {response.text}")
+        except Exception as e:
+            logger.error(f"Error en create_cloudwatch_datasource: {e}")
+            raise
+
     async def get_datasources(self) -> list:
         """Lista todos los datasources"""
         try:

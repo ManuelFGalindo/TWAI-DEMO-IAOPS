@@ -170,6 +170,7 @@ export function Monitoring() {
               <option value="vms">Virtual Machines / EC2</option>
               <option value="storage">Storage Accounts / S3</option>
               <option value="aks">Kubernetes (AKS/EKS/GKE)</option>
+              <option value="amplify">AWS Amplify</option>
               <option value="resource_groups">Resource Groups / Resource Managers</option>
             </select>
           </div>

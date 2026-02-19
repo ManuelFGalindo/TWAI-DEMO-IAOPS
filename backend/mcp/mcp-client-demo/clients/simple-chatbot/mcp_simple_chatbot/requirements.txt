@@ -1,0 +1,9 @@
+python-dotenv
+requests
+mcp
+uvicorn
+fastapi
+boto3
+langchain
+langchain-aws
+langchain_ollama

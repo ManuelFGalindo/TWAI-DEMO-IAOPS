@@ -22,9 +22,11 @@ class AWSConnector(BaseCloudConnector):
     async def connect(self) -> bool:
         """Establece conexión con AWS"""
         try:
+            session_token = self.credentials.get("session_token") or None
             self.session = boto3.Session(
                 aws_access_key_id=self.credentials.get("access_key_id"),
                 aws_secret_access_key=self.credentials.get("secret_access_key"),
+                aws_session_token=session_token,
                 region_name=self.region
             )
             
@@ -73,6 +75,8 @@ class AWSConnector(BaseCloudConnector):
                 return await self._list_ecs_clusters()
             elif resource_type == "eks":
                 return await self._list_eks_clusters()
+            elif resource_type == "amplify":
+                return await self._list_amplify_apps()
             else:
                 logger.warning(f"Tipo de recurso no soportado: {resource_type}")
                 return []
@@ -190,6 +194,38 @@ class AWSConnector(BaseCloudConnector):
         
         return clusters
     
+    async def _list_amplify_apps(self) -> List[Dict[str, Any]]:
+        """Lista aplicaciones de AWS Amplify"""
+        amplify = self.session.client('amplify', region_name=self.region)
+        response = amplify.list_apps(maxResults=100)
+
+        apps = []
+        for app in response.get('apps', []):
+            # Estado de la app
+            raw_status = app.get('productionBranch', {}).get('status', 'UNKNOWN')
+            status = 'running' if raw_status in ['SUCCEED', 'DEPLOYED'] else \
+                     'stopped' if raw_status in ['FAILED', 'CANCELLED'] else 'pending'
+
+            apps.append({
+                'id': app['appId'],
+                'name': app.get('name', app['appId']),
+                'type': 'amplify_app',
+                'status': status,
+                'platform': app.get('platform', 'WEB'),
+                'repository': app.get('repository', '-'),
+                'default_domain': app.get('defaultDomain', '-'),
+                'create_time': str(app.get('createTime', '')),
+                'behavior': {
+                    'platform': app.get('platform', 'WEB'),
+                    'repository': app.get('repository', '-'),
+                    'default_domain': app.get('defaultDomain', '-'),
+                    'framework': app.get('framework', '-'),
+                    'branch_status': raw_status
+                }
+            })
+
+        return apps
+
     async def create_resource(
         self,
         resource_type: str,

@@ -164,11 +164,45 @@ async def create_dashboard(request: DashboardCreateRequest, db: AsyncSession = D
                 logger.error(f"Error en auto-configuración de DB: {e}")
                 # Fallthrough al siguiente intento
 
-    # Fallback: Intentar con variables de entorno (config.py / .env)
+    # Auto-configuración con AWS CloudWatch si el recurso es de AWS
     if not grafana_config:
         from app.core.config import settings
-        
-        if (settings.AZURE_TENANT_ID and settings.AZURE_SUBSCRIPTION_ID and 
+        is_aws_resource = request.resource_type in [
+            "amplify_app", "ec2_instance", "s3_bucket", "lambda_function",
+            "rds_instance", "ecs_cluster", "eks_cluster"
+        ]
+        if is_aws_resource and settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+            try:
+                logger.info(f"Auto-configurando Grafana CloudWatch para cliente {request.client_id}")
+                grafana = GrafanaService()
+                datasource_name = f"cloudwatch-{request.client_id[:8]}"
+                cw_result = await grafana.create_cloudwatch_datasource(
+                    name=datasource_name,
+                    access_key_id=settings.AWS_ACCESS_KEY_ID,
+                    secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                    session_token=settings.AWS_SESSION_TOKEN or None,
+                    region=settings.AWS_DEFAULT_REGION or "us-east-1"
+                )
+                grafana_config = GrafanaConfigModel(
+                    client_id=request.client_id,
+                    azure_tenant_id="aws",
+                    azure_subscription_id=settings.AWS_DEFAULT_REGION or "us-east-1",
+                    azure_client_id=settings.AWS_ACCESS_KEY_ID,
+                    azure_client_secret=settings.AWS_SECRET_ACCESS_KEY,
+                    datasource_name=datasource_name,
+                    datasource_id=str(cw_result.get('id') or cw_result.get('datasource', {}).get('id', ''))
+                )
+                db.add(grafana_config)
+                await db.commit()
+                logger.info("Auto-configuración CloudWatch completada")
+            except Exception as e:
+                logger.error(f"Error en auto-configuración CloudWatch: {e}")
+
+    # Fallback: Intentar con variables de entorno Azure (config.py / .env)
+    if not grafana_config:
+        from app.core.config import settings
+
+        if (settings.AZURE_TENANT_ID and settings.AZURE_SUBSCRIPTION_ID and
             settings.AZURE_CLIENT_ID and settings.AZURE_CLIENT_SECRET):
             
             try:
@@ -322,6 +356,10 @@ def _create_dashboard_json(
         dashboard["panels"] = _get_vm_panels(resource_id, datasource_name, subscription_id)
     elif resource_type in ["container_instance", "kubernetes_cluster"]:
         dashboard["panels"] = _get_container_panels(resource_id, datasource_name, subscription_id)
+    elif resource_type == "amplify_app":
+        dashboard["panels"] = _get_amplify_panels(resource_id, datasource_name, subscription_id)
+    elif resource_type == "ec2_instance":
+        dashboard["panels"] = _get_ec2_panels(resource_id, datasource_name, subscription_id)
     else:
         # Paneles genéricos
         dashboard["panels"] = _get_generic_panels(resource_id, datasource_name, subscription_id)
@@ -437,6 +475,72 @@ def _get_vm_panels(resource_id: str, datasource: str, subscription_id: str) -> l
 def _get_container_panels(resource_id: str, datasource: str, subscription_id: str) -> list:
     """Paneles para Containers"""
     return _get_generic_panels(resource_id, datasource, subscription_id)
+
+def _get_amplify_panels(resource_id: str, datasource: str, region: str) -> list:
+    """Paneles de CloudWatch para AWS Amplify"""
+    def cw_target(metric: str, stat: str = "Average") -> dict:
+        return {
+            "datasource": datasource,
+            "dimensions": {"App": resource_id},
+            "expression": "",
+            "id": "",
+            "matchExact": True,
+            "metricName": metric,
+            "namespace": "AWS/AmplifyHosting",
+            "period": "",
+            "refId": "A",
+            "region": "default",
+            "statistics": [stat]
+        }
+    return [
+        {
+            "id": 1, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "type": "timeseries", "title": "Requests",
+            "targets": [cw_target("Requests", "Sum")]
+        },
+        {
+            "id": 2, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+            "type": "timeseries", "title": "4xx Errors",
+            "targets": [cw_target("4xxErrors", "Sum")]
+        },
+        {
+            "id": 3, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+            "type": "timeseries", "title": "5xx Errors",
+            "targets": [cw_target("5xxErrors", "Sum")]
+        },
+        {
+            "id": 4, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+            "type": "timeseries", "title": "Bytes Downloaded",
+            "targets": [cw_target("BytesDownloaded", "Sum")]
+        }
+    ]
+
+
+def _get_ec2_panels(resource_id: str, datasource: str, region: str) -> list:
+    """Paneles de CloudWatch para EC2"""
+    def cw_target(metric: str, stat: str = "Average") -> dict:
+        return {
+            "datasource": datasource,
+            "dimensions": {"InstanceId": resource_id},
+            "metricName": metric,
+            "namespace": "AWS/EC2",
+            "refId": "A",
+            "region": "default",
+            "statistics": [stat]
+        }
+    return [
+        {
+            "id": 1, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+            "type": "timeseries", "title": "CPU Utilization",
+            "targets": [cw_target("CPUUtilization")]
+        },
+        {
+            "id": 2, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+            "type": "timeseries", "title": "Network In/Out",
+            "targets": [cw_target("NetworkIn", "Sum"), {**cw_target("NetworkOut", "Sum"), "refId": "B"}]
+        }
+    ]
+
 
 def _get_generic_panels(resource_id: str, datasource: str, subscription_id: str) -> list:
     """Paneles genéricos"""

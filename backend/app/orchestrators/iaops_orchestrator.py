@@ -207,9 +207,10 @@ class IAOPSOrchestrator:
                 'subscription_id': (settings.AZURE_SUBSCRIPTION_ID or "").strip()
             }
         elif provider == CloudProvider.AWS:
-             return {
+            return {
                 'access_key_id': (settings.AWS_ACCESS_KEY_ID or "").strip(),
                 'secret_access_key': (settings.AWS_SECRET_ACCESS_KEY or "").strip(),
+                'session_token': (settings.AWS_SESSION_TOKEN or "").strip() or None,
                 'region': (settings.AWS_DEFAULT_REGION or "").strip()
             }
         
@@ -295,9 +296,10 @@ class IAOPSOrchestrator:
         if cloud_provider not in client.tech_profile.clouds:
             raise ValueError(f"Cliente no tiene acceso a {cloud_provider}")
         
-        # Obtener credenciales y conector
+        # Obtener credenciales y conector (pasar región si viene en las credenciales)
         credentials = await self._get_client_cloud_credentials(client.id, cloud_provider)
-        connector = await self.get_cloud_connector(cloud_provider, credentials)
+        region = credentials.get('region') or None
+        connector = await self.get_cloud_connector(cloud_provider, credentials, region)
         
         # Listar recursos
         resources = await connector.list_resources(resource_type)

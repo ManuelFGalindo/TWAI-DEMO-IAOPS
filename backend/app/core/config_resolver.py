@@ -35,6 +35,7 @@ class ConfigResolver:
             return {
                 "access_key_id": settings.AWS_ACCESS_KEY_ID,
                 "secret_access_key": settings.AWS_SECRET_ACCESS_KEY,
+                "session_token": settings.AWS_SESSION_TOKEN or None,
                 "region": settings.AWS_DEFAULT_REGION
             }
         return {}
