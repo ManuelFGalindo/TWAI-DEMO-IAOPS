@@ -74,11 +74,12 @@ class ResetResponse(BaseModel):
 _global_lock = asyncio.Lock()
 _global_session: Optional[ChatSession] = None      # servidores MCP compartidos
 _histories: Dict[str, List[Dict[str, str]]] = {}   # historial por session_id
+_aws_account_id: Optional[str] = None              # Account ID real de las credenciales
 
 
 async def _get_or_init_mcp_session() -> ChatSession:
     """Inicializa los servidores MCP una sola vez. Thread-safe."""
-    global _global_session
+    global _global_session, _aws_account_id
     async with _global_lock:
         # Re-inicializar si ningún servidor sigue vivo
         needs_init = (
@@ -89,6 +90,23 @@ async def _get_or_init_mcp_session() -> ChatSession:
             return _global_session
 
         logger.info("Inicializando servidores MCP...")
+        _ = Configuration()
+
+        # Obtener el Account ID real de las credenciales
+        if _aws_account_id is None:
+            try:
+                import boto3 as _boto3
+                sts = _boto3.client(
+                    "sts",
+                    region_name=os.getenv("AWS_REGION", "us-east-1"),
+                    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                    aws_session_token=os.getenv("AWS_SESSION_TOKEN") or None,
+                )
+                _aws_account_id = sts.get_caller_identity()["Account"]
+                logger.info(f"AWS Account ID: {_aws_account_id}")
+            except Exception as e:
+                logger.warning(f"No se pudo obtener el Account ID: {e}")
         _ = Configuration()
 
         cfg_path = _HERE / "servers_config.json"
@@ -432,17 +450,54 @@ async def _agentic_stream(
                     poll_data  = final_poll.get("cfn_data") or {}
                     identifier = poll_data.get("identifier", "") or ""
                     p_status   = poll_data.get("status", "")
-                    if identifier and identifier != "N/A":
+                    err_msg    = poll_data.get("error_message", "") or ""
+                    if p_status == "FAILED":
+                        # Detener el loop: no reintentar, informar el error
                         step_text = (
-                            f"Recurso `{res_type}` procesado.\n"
-                            f"- Estado final: `{p_status}`\n"
-                            f"- Identificador: `{identifier}`\n\n"
-                            f"Usa exactamente `{identifier}` como VpcId/SubnetId en los siguientes pasos."
+                            f"❌ La operación sobre `{res_type}` FALLÓ.\n"
+                            f"- Error: {err_msg or 'desconocido'}\n\n"
+                            "NO reintentes esta operación. Informa el error al usuario."
+                        )
+                    elif identifier and identifier != "N/A":
+                        # Construir referencia al identificador según el tipo de recurso
+                        id_label = {
+                            "AWS::EC2::VPC":    "VpcId",
+                            "AWS::EC2::Subnet": "SubnetId",
+                            "AWS::IAM::Role":   "RoleArn (construye como arn:aws:iam::" + (_aws_account_id or "ACCOUNT_ID") + ":role/" + identifier + ")",
+                            "AWS::SQS::Queue":  "QueueUrl",
+                            "AWS::Lambda::Function": "FunctionName",
+                            "AWS::S3::Bucket":  "BucketName",
+                        }.get(res_type, "identificador")
+                        step_text = (
+                            f"Recurso `{res_type}` creado exitosamente.\n"
+                            f"- Estado: `{p_status}`\n"
+                            f"- {id_label}: `{identifier}`\n\n"
+                            f"Usa exactamente ese valor en los siguientes pasos."
                         )
                     else:
                         step_text = final_poll.get("text", f"Operación `{res_type}` estado: {p_status}")
                 else:
                     step_text = f"Operación sobre `{res_type}` completada (token: `{token}`)."
+
+                # Si falló, detener el loop agentic aquí
+                if result_holder and (result_holder[0].get("cfn_data") or {}).get("status") == "FAILED":
+                    # Texto limpio para el usuario (sin instrucciones internas al LLM)
+                    poll_data_fail = result_holder[0].get("cfn_data") or {}
+                    user_facing_error = (
+                        f"❌ La operación sobre `{res_type}` FALLÓ.\n"
+                        f"- Error: {poll_data_fail.get('error_message') or 'Ver mensaje de error arriba.'}"
+                    )
+                    accumulated.append(user_facing_error)
+                    # Texto con instrucción para el LLM (lleva el "NO reintentes")
+                    llm_fail_text = user_facing_error + "\n\nNO reintentes esta operación."
+                    history.append({"role": "assistant", "content": llm_fail_text})
+                    # Pedir al LLM que explique el error (una sola vez, sin retry)
+                    history.append({"role": "user", "content": (
+                        "[OPERACIÓN FALLIDA]\n" + llm_fail_text +
+                        "\n\nExplica el error al usuario en español y responde con "
+                        '{"decision": "answer", "answer": "<explicación del error>"}'
+                    )})
+                    continue  # el LLM responderá con answer en la siguiente iteración
             else:
                 yield _sse("step", {
                     "iteration": iteration + 1,
@@ -464,8 +519,6 @@ async def _agentic_stream(
                 '{"decision": "answer", "answer": "<resumen en español de todo lo realizado>"}'
             )
             history.append({"role": "user", "content": continuation_msg})
-
-        # Límite de iteraciones
         summary = "\n\n".join(accumulated)
         yield _sse("done", {
             "mode": "tool",
@@ -498,6 +551,20 @@ async def chat_stream(req: ChatRequest):
         user_content = f"{MODE_HINTS[req.mode]}\n{req.message}"
 
     history.append({"role": "user", "content": user_content})
+
+    # Inyectar contexto del account ID al inicio del historial (una sola vez por sesión)
+    if _aws_account_id and not any(
+        "[CONTEXTO AWS]" in (m.get("content") or "") for m in history
+    ):
+        history.insert(0, {
+            "role": "system",
+            "content": (
+                f"[CONTEXTO AWS] Account ID: {_aws_account_id} | "
+                f"Región: {os.getenv('AWS_REGION', 'us-east-1')}\n"
+                "Usa este Account ID al construir ARNs de IAM roles. "
+                "NUNCA uses ARNs de otra cuenta."
+            ),
+        })
 
     return StreamingResponse(
         _agentic_stream(mcp_session, history, req.mode),

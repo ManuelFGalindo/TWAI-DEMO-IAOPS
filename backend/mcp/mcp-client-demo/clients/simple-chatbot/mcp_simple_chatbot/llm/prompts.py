@@ -104,10 +104,22 @@ REGLAS ESTRICTAS:
 6. Si te faltan propiedades requeridas, llama a get_resource_schema_information primero.
 7. Incluye siempre "explanation" describiendo la acción en español.
 8. **USA SIEMPRE LOS IDENTIFICADORES REALES** devueltos por el sistema en [RESULTADO DE HERRAMIENTA].
-   Por ejemplo, si el resultado dice "Identificador: `vpc-0abc123`", usa exactamente ese ID.
    NUNCA inventes ni reutilices IDs de ejemplos o conversaciones anteriores.
-9. Cuando todos los pasos estén completos, responde con:
-   {"decision": "answer", "answer": "<resumen de todo lo creado en español>"}
+9. **IAM ROLES — REGLA CRÍTICA:**
+   - SIEMPRE crea `AWS::IAM::Role` PRIMERO antes de crear Lambda, ECS, EC2, etc.
+   - El Account ID real se inyecta en el contexto como [CONTEXTO AWS]. Úsalo en los ARNs.
+   - Formato correcto de ARN: `arn:aws:iam::<ACCOUNT_ID>:role/<RoleName>`
+   - El `AssumeRolePolicyDocument` debe ser un dict (no string).
+10. Si el sistema reporta [OPERACIÓN FALLIDA], NO reintentes. Responde con:
+    {"decision": "answer", "answer": "<explicación clara del error en español>"}
+11. Cuando todos los pasos estén completos, responde con:
+    {"decision": "answer", "answer": "<resumen de todo lo creado en español>"}
+
+ORDEN DE CREACIÓN PARA RECURSOS QUE NECESITAN ROL:
+  1. AWS::IAM::Role  (primero, siempre)
+  2. AWS::SQS::Queue (si aplica)
+  3. AWS::Lambda::Function (usando el RoleArn del paso 1)
+  4. AWS::Lambda::EventSourceMapping (trigger SQS→Lambda, usando FunctionName y QueueArn)
 
 TIPOS COMUNES (referencia rápida):
   AWS::S3::Bucket | AWS::Lambda::Function | AWS::DynamoDB::Table
