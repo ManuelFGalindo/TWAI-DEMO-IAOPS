@@ -15,7 +15,7 @@ const MCP_BASE_URL =
 const mcpApi = axios.create({
   baseURL: MCP_BASE_URL,
   headers: { 'Content-Type': 'application/json' },
-  timeout: 120_000, // 2 min: MCP servers pueden tardar en iniciar
+  timeout: 300_000, // 5 min para operaciones multi-paso
 });
 
 // ─── Tipos ────────────────────────────────────────────────────────────────────
@@ -83,4 +83,91 @@ export async function getHistory(
 ): Promise<{ session_id: string; messages: Array<{ role: string; content: string }> }> {
   const response = await mcpApi.get('/history', { params: { session_id } });
   return response.data;
+}
+
+// ─── SSE streaming ────────────────────────────────────────────────────────────
+
+export type SseEventType = 'thinking' | 'step' | 'done' | 'error';
+
+export interface SseThinkingEvent {
+  type: 'thinking';
+  iteration: number;
+  message: string;
+}
+
+export interface SseStepEvent {
+  type: 'step';
+  iteration: number;
+  mode: 'tool';
+  text: string;
+  cfn_data?: Record<string, unknown> | null;
+}
+
+export interface SseDoneEvent {
+  type: 'done';
+  mode: ChatResponse['mode'];
+  text: string;
+  cfn_data?: Record<string, unknown> | null;
+}
+
+export interface SseErrorEvent {
+  type: 'error';
+  message: string;
+}
+
+export type SseEvent = SseThinkingEvent | SseStepEvent | SseDoneEvent | SseErrorEvent;
+
+/**
+ * Envía un mensaje al backend usando SSE para recibir actualizaciones en tiempo real.
+ * Llama a onEvent por cada evento recibido (thinking, step, done, error).
+ */
+export async function streamChatMessage(
+  req: ChatRequest,
+  onEvent: (event: SseEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const baseUrl = import.meta.env.VITE_MCP_API_URL || 'http://localhost:8001';
+  const url = `${baseUrl}/api/ai/aws/chat/stream`;
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(req),
+    signal,
+  });
+
+  if (!response.ok || !response.body) {
+    const text = await response.text().catch(() => response.statusText);
+    throw new Error(text || `HTTP ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // Parsear bloques SSE delimitados por \n\n
+    const blocks = buffer.split('\n\n');
+    buffer = blocks.pop() ?? '';
+
+    for (const block of blocks) {
+      let eventType = '';
+      let dataStr = '';
+      for (const line of block.split('\n')) {
+        if (line.startsWith('event: ')) eventType = line.slice(7).trim();
+        if (line.startsWith('data: '))  dataStr  = line.slice(6).trim();
+      }
+      if (!dataStr) continue;
+      try {
+        const payload = JSON.parse(dataStr);
+        onEvent({ type: eventType as SseEventType, ...payload });
+      } catch {
+        // ignorar bloques malformados
+      }
+    }
+  }
 }

@@ -4,6 +4,5 @@ mcp
 uvicorn
 fastapi
 boto3
-langchain
+langchain-core
 langchain-aws
-langchain_ollama

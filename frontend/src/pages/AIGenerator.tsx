@@ -5,7 +5,7 @@ import { ArchitectureRequest, Architecture, Client, DeploymentRequest } from '@/
 import { architectureService } from '@/services/architectureService';
 import { clientService } from '@/services/clientService';
 import { deploymentService } from '@/services/deploymentService';
-import { sendChatMessage, resetSession, ChatMessage, ChatMode } from '@/services/mcpService';
+import { streamChatMessage, resetSession, ChatMessage, ChatMode } from '@/services/mcpService';
 import { Alert } from '@/components/Alert';
 import toast from 'react-hot-toast';
 
@@ -15,7 +15,6 @@ const CHAT_MODES: { value: ChatMode; label: string; description: string }[] = [
   { value: 'auto',           label: 'Auto',           description: 'El modelo detecta si quieres diagrama o infraestructura real' },
   { value: 'diagram',        label: 'Diagrama',        description: 'Genera un diagrama visual de arquitectura AWS' },
   { value: 'infrastructure', label: 'Infraestructura', description: 'Crea y gestiona recursos reales en AWS vía CloudFormation' },
-  { value: 'both',           label: 'Ambos',           description: 'Genera el diagrama Y crea los recursos en AWS' },
 ];
 
 // ─── MessageBubble ────────────────────────────────────────────────────────────
@@ -57,10 +56,12 @@ export function AIGenerator() {
   // AWS MCP chat state
   const [awsMessages, setAwsMessages] = useState<ChatMessage[]>([]);
   const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpStatusText, setMcpStatusText] = useState('');
   const [mcpMode, setMcpMode] = useState<ChatMode>('auto');
   const [mcpInput, setMcpInput] = useState('');
   const [mcpSessionId] = useState(`session-${Date.now()}`);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const { register, handleSubmit, watch, setValue, formState: { errors } } = useForm<ArchitectureRequest>();
 
@@ -158,29 +159,71 @@ export function AIGenerator() {
     setAwsMessages(prev => [...prev, { role: 'user', content: text, timestamp: new Date() }]);
     setMcpInput('');
     setMcpLoading(true);
+    setMcpStatusText('🤔 Analizando...');
+
+    const abort = new AbortController();
+    abortRef.current = abort;
 
     try {
-      const response = await sendChatMessage({ message: text, session_id: mcpSessionId, mode: mcpMode });
-      setAwsMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: response.text, mode: response.mode, cfn_data: response.cfn_data, timestamp: new Date() },
-      ]);
+      await streamChatMessage(
+        { message: text, session_id: mcpSessionId, mode: mcpMode },
+        (event) => {
+          if (event.type === 'thinking') {
+            setMcpStatusText(event.message);
+          } else if (event.type === 'step') {
+            // Resultado intermedio de una herramienta → aparece como burbuja
+            setAwsMessages(prev => [...prev, {
+              role: 'assistant',
+              content: event.text,
+              mode: 'tool',
+              cfn_data: event.cfn_data ?? undefined,
+              timestamp: new Date(),
+            }]);
+            setMcpStatusText(`⚙️ Paso ${event.iteration} completado, continuando...`);
+          } else if (event.type === 'done') {
+            setAwsMessages(prev => [...prev, {
+              role: 'assistant',
+              content: event.text,
+              mode: event.mode,
+              cfn_data: event.cfn_data ?? undefined,
+              timestamp: new Date(),
+            }]);
+          } else if (event.type === 'error') {
+            toast.error(event.message);
+            setAwsMessages(prev => [...prev, {
+              role: 'assistant',
+              content: `❌ Error: ${event.message}`,
+              mode: 'answer',
+              timestamp: new Date(),
+            }]);
+          }
+        },
+        abort.signal,
+      );
     } catch (error: unknown) {
+      if ((error as { name?: string }).name === 'AbortError') return;
       const e = error as { response?: { data?: { detail?: string } }; message?: string };
       const errText = e?.response?.data?.detail || e?.message || 'Error al comunicarse con el asistente AWS';
       toast.error(errText);
-      setAwsMessages(prev => [
-        ...prev,
-        { role: 'assistant', content: `❌ Error: ${errText}`, mode: 'answer', timestamp: new Date() },
-      ]);
+      setAwsMessages(prev => [...prev, {
+        role: 'assistant',
+        content: `❌ Error: ${errText}`,
+        mode: 'answer',
+        timestamp: new Date(),
+      }]);
     } finally {
       setMcpLoading(false);
+      setMcpStatusText('');
+      abortRef.current = null;
     }
   };
 
   const handleResetSession = async () => {
+    abortRef.current?.abort();
     try { await resetSession(mcpSessionId); } catch { /* ignore */ }
     setAwsMessages([]);
+    setMcpLoading(false);
+    setMcpStatusText('');
     toast.success('Conversación reiniciada');
   };
 
@@ -294,7 +337,7 @@ export function AIGenerator() {
                 )}
               </div>
 
-              {selectedClient && (
+              {selectedClient && !isAwsMode && (
                 <div className="bg-blue-50 border border-blue-100 rounded-lg p-4 text-sm space-y-2">
                   <div className="flex items-center text-blue-800 font-medium mb-2">
                     <Server className="w-4 h-4 mr-2" />
@@ -456,11 +499,16 @@ export function AIGenerator() {
                 {mcpLoading && (
                   <div className="flex justify-start mb-3">
                     <div className="bg-white border border-gray-200 rounded-2xl rounded-tl-sm px-4 py-3 shadow-sm">
-                      <div className="flex items-center gap-1.5">
-                        {['-0.3s', '-0.15s', '0s'].map((d, i) => (
-                          <div key={i} className="w-2 h-2 rounded-full bg-primary-400 animate-bounce"
-                            style={{ animationDelay: d }} />
-                        ))}
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
+                          {['-0.3s', '-0.15s', '0s'].map((d, i) => (
+                            <div key={i} className="w-2 h-2 rounded-full bg-primary-400 animate-bounce"
+                              style={{ animationDelay: d }} />
+                          ))}
+                        </div>
+                        {mcpStatusText && (
+                          <span className="text-xs text-gray-500 ml-1">{mcpStatusText}</span>
+                        )}
                       </div>
                     </div>
                   </div>

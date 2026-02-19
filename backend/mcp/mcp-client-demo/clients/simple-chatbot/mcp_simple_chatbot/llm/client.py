@@ -3,8 +3,7 @@ import boto3
 from typing import List, Dict
 from langchain_aws import ChatBedrock
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain.output_parsers import PydanticOutputParser
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
 from .schemas import DecisionEnvelope, IntentEnvelope
 from .prompts import SYSTEM_PROMPT_BASE, SYSTEM_PROMPT_CFN, CHAT_SYSTEM, INTENT_PROMPT
 from botocore.config import Config

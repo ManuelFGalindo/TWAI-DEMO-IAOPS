@@ -22,11 +22,12 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # ─── Añadir el paquete al path ───────────────────────────────────────────────
@@ -217,42 +218,294 @@ async def get_history(session_id: str = "default"):
 async def chat(req: ChatRequest):
     """
     Procesa un mensaje de usuario a través del LLM + MCP servers.
-    Devuelve la respuesta del asistente.
+    Implementa un agentic loop: ejecuta una herramienta por turno,
+    pasa el resultado al LLM, repite hasta que decida 'answer' o se
+    alcance el máximo de iteraciones.
     """
     session_id = req.session_id or "default"
     history = _get_history(session_id)
 
-    # Intentar obtener/inicializar los servidores MCP
     try:
         mcp_session = await _get_or_init_mcp_session()
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=f"Servidores MCP no disponibles: {e}")
 
-    # Inyectar hint de modo si el frontend lo especificó
+    # Inyectar hint de modo
     user_content = req.message
     if req.mode and req.mode in MODE_HINTS:
         user_content = f"{MODE_HINTS[req.mode]}\n{req.message}"
 
     history.append({"role": "user", "content": user_content})
 
+    MAX_ITERATIONS = 8
+    accumulated_steps: List[str] = []
+    final_out: Dict[str, Any] = {"mode": "answer", "text": ""}
+
     try:
-        llm_response = await mcp_session.llm_client.get_response(history)
-        out = await mcp_session.process_llm_response(llm_response, history)
+        for iteration in range(MAX_ITERATIONS):
+            llm_response = await mcp_session.llm_client.get_response(history)
+            out = await mcp_session.process_llm_response(llm_response, history)
+            mode = out.get("mode", "answer")
+
+            # Si el LLM quiere responder directamente → fin del loop
+            if mode in ("answer", "raw"):
+                if accumulated_steps:
+                    steps_summary = "\n\n".join(accumulated_steps)
+                    final_text = out.get("text", "").strip()
+                    out["text"] = (
+                        steps_summary + ("\n\n" + final_text if final_text else "")
+                    ).strip()
+                final_out = out
+                history.append({"role": "assistant", "content": out.get("text", "")})
+                break
+
+            # Ejecutó una herramienta → acumular resultado
+            step_text = out.get("text", "")
+            accumulated_steps.append(step_text)
+            logger.info(f"Agentic loop iter={iteration + 1}: herramienta ejecutada")
+
+            # Pasar resultado al LLM para que decida el siguiente paso
+            history.append({"role": "assistant", "content": step_text})
+            history.append({
+                "role": "user",
+                "content": (
+                    "[RESULTADO DE HERRAMIENTA]\n"
+                    + step_text
+                    + "\n\nContinúa con el siguiente paso del plan original. "
+                    "Si ya completaste todos los pasos, responde con "
+                    '{"decision": "answer", "answer": "<resumen en español de todo lo realizado>"}'
+                ),
+            })
+            final_out = out  # por si se agota el límite
+
+        else:
+            # Límite de iteraciones alcanzado
+            summary = "\n\n".join(accumulated_steps)
+            final_out = {
+                "mode": "tool",
+                "text": summary + "\n\n⚠️ Se completaron todas las operaciones disponibles.",
+            }
+
     except Exception as e:
         logger.exception("Error procesando mensaje")
-        # No agregar al historial si falló
-        history.pop()
+        history.pop()  # quitar el mensaje de usuario que falló
         raise HTTPException(status_code=500, detail=str(e))
 
-    response_text = out.get("text", "")
-    history.append({"role": "assistant", "content": response_text})
-
     return ChatResponse(
-        mode=out.get("mode", "answer"),
-        text=response_text,
-        diagram_path=out.get("diagram_path"),
-        cfn_data=out.get("cfn_data"),
+        mode=final_out.get("mode", "answer"),
+        text=final_out.get("text", ""),
+        diagram_path=final_out.get("diagram_path"),
+        cfn_data=final_out.get("cfn_data"),
         session_id=session_id,
+    )
+
+
+# ─── SSE helpers ──────────────────────────────────────────────────────────────
+
+def _sse(event: str, data: Any) -> str:
+    """Serializa un evento SSE."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+_ASYNC_CFN_TOOLS = {"create_resource", "update_resource", "delete_resource"}
+_POLL_INTERVAL   = 6    # segundos entre polls
+_POLL_MAX_WAIT   = 600  # 10 minutos máximo
+
+
+async def _poll_with_sse(
+    mcp_session, server, request_token: str, resource_type: str,
+    result_holder: Optional[List] = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Hace polling via boto3 emitiendo un SSE 'thinking' por tick.
+    Al terminar, emite un 'step' con el resultado final y opcionalmente
+    almacena el poll_out en result_holder[0] para que el caller lo use.
+    """
+    elapsed = 0
+    while elapsed < _POLL_MAX_WAIT:
+        await asyncio.sleep(_POLL_INTERVAL)
+        elapsed += _POLL_INTERVAL
+        minutes, secs = divmod(elapsed, 60)
+        time_str = f"{minutes}m {secs}s" if minutes else f"{secs}s"
+        yield _sse("thinking", {
+            "iteration": 0,
+            "message": f"⏳ Esperando que `{resource_type}` esté listo... ({time_str})"
+        })
+        try:
+            poll_out = await mcp_session.poll_cfn_token(server, request_token)
+            data     = poll_out.get("cfn_data") or {}
+            status   = data.get("status", "")
+            is_done  = data.get("is_complete", False)
+            logger.info(f"CFN poll token={request_token} status={status} elapsed={elapsed}s")
+            if is_done or status in ("SUCCESS", "FAILED", "CANCEL_COMPLETE"):
+                yield _sse("step", {
+                    "iteration": 0,
+                    "mode": "tool",
+                    "text": poll_out.get("text", ""),
+                    "cfn_data": data,
+                })
+                if result_holder is not None:
+                    result_holder.append(poll_out)  # pasar resultado al caller
+                return
+        except Exception as exc:
+            logger.warning(f"CFN poll error (token={request_token}): {exc}")
+
+    timeout_out = {
+        "mode": "tool",
+        "text": (
+            f"⚠️ Tiempo de espera agotado ({_POLL_MAX_WAIT}s).\n"
+            f"La operación sigue en progreso. Token: `{request_token}`"
+        ),
+        "cfn_data": {"request_token": request_token, "status": "IN_PROGRESS", "is_complete": False},
+    }
+    yield _sse("step", {"iteration": 0, "mode": "tool", **{k: v for k, v in timeout_out.items() if k != "mode"}})
+    if result_holder is not None:
+        result_holder.append(timeout_out)
+
+
+async def _agentic_stream(
+    mcp_session, history: List[Dict[str, str]], mode_hint: Optional[str]
+) -> AsyncGenerator[str, None]:
+    """
+    Generador async que ejecuta el agentic loop y emite SSE para cada paso:
+      thinking  — el LLM está procesando
+      step      — una herramienta fue ejecutada (resultado intermedio)
+      done      — respuesta final
+      error     — error irrecuperable
+    """
+    MAX_ITERATIONS = 8
+    accumulated: List[str] = []
+
+    try:
+        for iteration in range(MAX_ITERATIONS):
+            yield _sse("thinking", {
+                "iteration": iteration + 1,
+                "message": "🤔 Analizando..." if iteration == 0 else f"⚙️ Paso {iteration + 1}..."
+            })
+
+            llm_response = await mcp_session.llm_client.get_response(history)
+            out  = await mcp_session.process_llm_response(llm_response, history)
+            mode = out.get("mode", "answer")
+
+            if mode in ("answer", "raw"):
+                text = out.get("text", "")
+                if accumulated and text.strip():
+                    text = "\n\n".join(accumulated) + "\n\n" + text
+                elif accumulated:
+                    text = "\n\n".join(accumulated)
+                history.append({"role": "assistant", "content": text})
+                yield _sse("done", {
+                    "mode": mode,
+                    "text": text,
+                    "cfn_data": out.get("cfn_data"),
+                })
+                return
+
+            # Herramienta ejecutada
+            step_text = out.get("text", "")
+            cfn_data  = out.get("cfn_data") or {}
+            server    = out.get("_server")   # servidor que ejecutó la tool
+
+            # ── Polling SSE para operaciones asíncronas de CFN ────────────────
+            token       = cfn_data.get("request_token") or ""
+            is_complete = cfn_data.get("is_complete", True)
+            res_type    = cfn_data.get("resource_type") or "recurso"
+
+            if token and not is_complete and server:
+                # Emitir el "iniciando" inmediatamente
+                yield _sse("step", {
+                    "iteration": iteration + 1,
+                    "mode": "tool",
+                    "text": step_text,
+                    "cfn_data": cfn_data,
+                })
+                # Polling visible — result_holder recibe el resultado final
+                result_holder: List[Dict] = []
+                async for sse_chunk in _poll_with_sse(
+                    mcp_session, server, token, res_type, result_holder
+                ):
+                    yield sse_chunk
+
+                # Construir step_text con el identificador REAL para el historial
+                if result_holder:
+                    final_poll = result_holder[0]
+                    poll_data  = final_poll.get("cfn_data") or {}
+                    identifier = poll_data.get("identifier", "") or ""
+                    p_status   = poll_data.get("status", "")
+                    if identifier and identifier != "N/A":
+                        step_text = (
+                            f"Recurso `{res_type}` procesado.\n"
+                            f"- Estado final: `{p_status}`\n"
+                            f"- Identificador: `{identifier}`\n\n"
+                            f"Usa exactamente `{identifier}` como VpcId/SubnetId en los siguientes pasos."
+                        )
+                    else:
+                        step_text = final_poll.get("text", f"Operación `{res_type}` estado: {p_status}")
+                else:
+                    step_text = f"Operación sobre `{res_type}` completada (token: `{token}`)."
+            else:
+                yield _sse("step", {
+                    "iteration": iteration + 1,
+                    "mode": "tool",
+                    "text": step_text,
+                    "cfn_data": cfn_data,
+                })
+
+            accumulated.append(step_text)
+            history.append({"role": "assistant", "content": step_text})
+            # Construir mensaje de continuación enfatizando IDs reales
+            continuation_msg = (
+                "[RESULTADO DE HERRAMIENTA]\n"
+                + step_text
+                + "\n\n⚠️ IMPORTANTE: Usa ÚNICAMENTE los identificadores reales mostrados arriba. "
+                "NO inventes ni reutilices IDs de recursos anteriores.\n\n"
+                "Continúa con el siguiente paso del plan original. "
+                "Si ya completaste todos los pasos, responde con "
+                '{"decision": "answer", "answer": "<resumen en español de todo lo realizado>"}'
+            )
+            history.append({"role": "user", "content": continuation_msg})
+
+        # Límite de iteraciones
+        summary = "\n\n".join(accumulated)
+        yield _sse("done", {
+            "mode": "tool",
+            "text": summary + "\n\n⚠️ Se completaron todas las operaciones disponibles.",
+            "cfn_data": None,
+        })
+
+    except Exception as exc:
+        logger.exception("Error en agentic stream")
+        yield _sse("error", {"message": str(exc)})
+
+
+@app.post("/api/ai/aws/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    Versión SSE del endpoint de chat.
+    Emite eventos en tiempo real para cada paso del agentic loop.
+    Tipos: thinking | step | done | error
+    """
+    session_id = req.session_id or "default"
+    history = _get_history(session_id)
+
+    try:
+        mcp_session = await _get_or_init_mcp_session()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=f"Servidores MCP no disponibles: {e}")
+
+    user_content = req.message
+    if req.mode and req.mode in MODE_HINTS:
+        user_content = f"{MODE_HINTS[req.mode]}\n{req.message}"
+
+    history.append({"role": "user", "content": user_content})
+
+    return StreamingResponse(
+        _agentic_stream(mcp_session, history, req.mode),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

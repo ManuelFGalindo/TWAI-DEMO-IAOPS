@@ -63,10 +63,24 @@ services:
     image: squidfunk/mkdocs-material:latest
     container_name: iaops-docs
     ports:
-      - "8001:8000"
+      - "8002:8000"
     volumes:
       - ./:/docs
     command: serve --dev-addr=0.0.0.0:8000
+    networks:
+      - iaops-network
+
+  mcp:
+    build:
+      context: ./backend/mcp/mcp-client-demo/clients/simple-chatbot
+      dockerfile: Dockerfile
+    container_name: iaops-mcp
+    ports:
+      - "8001:8001"
+    env_file:
+      - ./backend/mcp/mcp-client-demo/clients/simple-chatbot/.env.mcp
+    environment:
+      - MCP_API_PORT=8001
     networks:
       - iaops-network
 

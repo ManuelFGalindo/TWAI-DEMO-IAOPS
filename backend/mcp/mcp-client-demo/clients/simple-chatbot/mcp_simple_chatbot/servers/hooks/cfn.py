@@ -23,7 +23,8 @@ CFN_TOOLS = {
     "delete_resource",
     "list_resources",
     "get_resource_schema_information",
-    "get_request_status",
+    # "get_request_status" — no está en la versión instalada del cfn-mcp-server;
+    #                        el polling se hace via boto3 directamente en session.py
     "create_template",
 }
 
@@ -32,25 +33,44 @@ def is_cfn_tool(tool_name: str) -> bool:
     return tool_name in CFN_TOOLS
 
 
+# Mapeo de nombres legacy (formato CloudControl nativo) → nombres del cfn-mcp-server
+_LEGACY_KEY_MAP = {
+    "TypeName":      "resource_type",
+    "Identifier":    "identifier",
+    "DesiredState":  "properties",
+    "PatchDocument": "patch_document",
+    "RequestToken":  "request_token",
+    "TemplateName":  "template_name",
+    "Resources":     "resources",
+}
+
+
 def preprocess_cfn_tool(envelope: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """
     Extrae nombre y argumentos del envelope del LLM.
-    Aplica coerciones necesarias:
-      - DesiredState dict → JSON string (como espera Cloud Control API)
-      - PatchDocument dict → JSON string
+    - Remapea claves legacy (TypeName/DesiredState/...) a los nombres reales
+      que usa el cfn-mcp-server (resource_type/properties/...).
+    - Serializa 'properties' y 'patch_document' a JSON string cuando son dicts/lists,
+      ya que la Cloud Control API los espera como string.
     """
     tool_name = envelope.get("tool", "")
-    args = dict(envelope.get("arguments", {}) or {})
+    raw_args = dict(envelope.get("arguments", {}) or {})
 
-    # Cloud Control API espera DesiredState como string JSON
+    # Remapar claves legacy → nombres del servidor MCP
+    args = {}
+    for k, v in raw_args.items():
+        canonical = _LEGACY_KEY_MAP.get(k, k)
+        args[canonical] = v
+
+    # 'properties' debe ser string JSON (Cloud Control API lo exige)
     if tool_name in {"create_resource", "update_resource"}:
-        if "DesiredState" in args and isinstance(args["DesiredState"], dict):
-            args["DesiredState"] = json.dumps(args["DesiredState"])
+        if "properties" in args and isinstance(args["properties"], dict):
+            args["properties"] = json.dumps(args["properties"])
 
-    # PatchDocument también debe ser string JSON (lista de operaciones RFC 6902)
+    # 'patch_document' también debe ser string JSON (RFC 6902)
     if tool_name == "update_resource":
-        if "PatchDocument" in args and isinstance(args["PatchDocument"], (dict, list)):
-            args["PatchDocument"] = json.dumps(args["PatchDocument"])
+        if "patch_document" in args and isinstance(args["patch_document"], (dict, list)):
+            args["patch_document"] = json.dumps(args["patch_document"])
 
     return tool_name, args
 
@@ -77,18 +97,40 @@ def postprocess_cfn_result(
     # ─── Formateo por tipo de operación ───────────────────────────────────────
 
     if tool_name == "create_resource":
+        # Formato normalizado del cfn-mcp-server
+        status    = data.get("status") or ""
+        rt        = data.get("resource_type") or ""
+        token     = data.get("request_token") or ""
+        is_done   = data.get("is_complete", True)
+        ident     = data.get("identifier") or "pendiente"
+        # Fallback: formato ProgressEvent legacy
         pe = data.get("ProgressEvent") or {}
         if pe:
+            status  = pe.get("OperationStatus", status)
+            rt      = pe.get("TypeName", rt)
+            ident   = pe.get("Identifier", ident)
+            token   = pe.get("RequestToken", token)
+            is_done = (status == "SUCCESS")
+        # Normalizar data para que el pipeline de polling lo lea
+        data["status"]        = status
+        data["is_complete"]   = is_done
+        data["request_token"] = token
+        data.setdefault("resource_type", rt)
+        if not is_done:
             msg = (
-                f"**Creación iniciada** ✅\n"
-                f"- Tipo: `{pe.get('TypeName', 'N/A')}`\n"
-                f"- Identificador: `{pe.get('Identifier', 'pendiente')}`\n"
-                f"- Estado: `{pe.get('OperationStatus', 'N/A')}`\n"
-                f"- Mensaje: {pe.get('StatusMessage', '') or 'OK'}"
+                f"⏳ **Creación en progreso...**\n"
+                f"- Tipo: `{rt}`\n"
+                f"- Token: `{token}`"
+            )
+        elif status in ("SUCCESS", "COMPLETE"):
+            msg = (
+                f"✅ **Recurso creado exitosamente.**\n"
+                f"- Tipo: `{rt}`\n"
+                f"- Identificador: `{ident}`"
             )
         else:
             msg = (
-                f"**Recurso creado.**\n"
+                f"**Recurso procesado.** 🔄\n"
                 f"```json\n{json.dumps(data, indent=2, ensure_ascii=False)[:500]}\n```"
             )
 
@@ -111,28 +153,95 @@ def postprocess_cfn_result(
             msg += "\n*(truncado)*"
 
     elif tool_name in {"update_resource", "delete_resource"}:
+        op_label  = "Actualización" if tool_name == "update_resource" else "Eliminación"
+        # Formato normalizado
+        status    = data.get("status") or ""
+        rt        = data.get("resource_type") or ""
+        token     = data.get("request_token") or ""
+        is_done   = data.get("is_complete", True)
+        ident     = data.get("identifier") or "N/A"
         pe = data.get("ProgressEvent") or {}
-        op_label = "Actualización" if tool_name == "update_resource" else "Eliminación"
-        msg = (
-            f"**{op_label} iniciada** ✅\n"
-            f"- Tipo: `{pe.get('TypeName', 'N/A')}`\n"
-            f"- Identificador: `{pe.get('Identifier', 'N/A')}`\n"
-            f"- Estado: `{pe.get('OperationStatus', 'N/A')}`"
-        )
+        if pe:
+            status  = pe.get("OperationStatus", status)
+            rt      = pe.get("TypeName", rt)
+            ident   = pe.get("Identifier", ident)
+            token   = pe.get("RequestToken", token)
+            is_done = (status == "SUCCESS")
+        data["status"]        = status
+        data["is_complete"]   = is_done
+        data["request_token"] = token
+        data.setdefault("resource_type", rt)
+        if not is_done:
+            msg = (
+                f"⏳ **{op_label} en progreso...**\n"
+                f"- Tipo: `{rt}`\n"
+                f"- Identificador: `{ident}`\n"
+                f"- Token: `{token}`"
+            )
+        else:
+            msg = (
+                f"✅ **{op_label} completada.**\n"
+                f"- Tipo: `{rt}`\n"
+                f"- Identificador: `{ident}`"
+            )
 
     elif tool_name == "get_request_status":
+        # ── Extraer status desde todos los posibles formatos ──────────────────
+        # 1. Formato normalizado cfn-mcp-server: {status, resource_type, identifier, is_complete}
+        # 2. Formato ProgressEvent legacy: {ProgressEvent: {OperationStatus, TypeName, ...}}
+        # 3. Formato texto plano / raw si JSON falló
+        status  = data.get("status") or data.get("OperationStatus") or ""
+        rt      = data.get("resource_type") or data.get("TypeName") or ""
+        ident   = data.get("identifier") or data.get("Identifier") or "N/A"
+        is_done = data.get("is_complete", False)
+        err_msg = data.get("error_message") or data.get("StatusMessage") or ""
+        token   = data.get("request_token") or data.get("RequestToken") or ""
+
+        # Fallback ProgressEvent (formato legacy CloudControl)
         pe = data.get("ProgressEvent") or {}
-        status_emoji = {"SUCCESS": "✅", "FAILED": "❌", "IN_PROGRESS": "⏳"}.get(
-            pe.get("OperationStatus", ""), "🔄"
+        if pe:
+            status  = pe.get("OperationStatus") or status
+            rt      = pe.get("TypeName") or rt
+            ident   = pe.get("Identifier") or ident
+            err_msg = pe.get("StatusMessage") or err_msg
+            token   = pe.get("RequestToken") or token
+
+        # Fallback: si el raw no pudo parsearse como JSON, buscar en texto
+        if not status and "raw" in data:
+            raw_text = data["raw"]
+            import re as _re
+            m = _re.search(r'OperationStatus["\s:]+([A-Z_]+)', raw_text)
+            if m:
+                status = m.group(1)
+            m2 = _re.search(r'TypeName["\s:]+([\w:]+)', raw_text)
+            if m2:
+                rt = m2.group(1)
+            m3 = _re.search(r'Identifier["\s:]+([\w\-/]+)', raw_text)
+            if m3:
+                ident = m3.group(1)
+
+        is_done = (status in ("SUCCESS", "COMPLETE")) or is_done
+
+        data["status"]        = status
+        data["is_complete"]   = is_done
+        data["request_token"] = token
+        data.setdefault("resource_type", rt)
+
+        logging.getLogger(__name__).info(
+            f"get_request_status parsed: status={status} is_done={is_done} rt={rt} ident={ident}"
         )
+
+        status_emoji = {"SUCCESS": "✅", "FAILED": "❌", "IN_PROGRESS": "⏳"}.get(status, "🔄")
         msg = (
             f"**Estado de la operación:** {status_emoji}\n"
-            f"- Operación: `{pe.get('Operation', 'N/A')}`\n"
-            f"- Estado: `{pe.get('OperationStatus', 'N/A')}`\n"
-            f"- Tipo: `{pe.get('TypeName', 'N/A')}`\n"
-            f"- Identificador: `{pe.get('Identifier', 'N/A')}`\n"
-            f"- Mensaje: {pe.get('StatusMessage', '') or 'Sin mensaje adicional'}"
+            f"- Tipo: `{rt}`\n"
+            f"- Estado: `{status}`\n"
+            f"- Identificador: `{ident}`"
         )
+        if err_msg:
+            msg += f"\n- Mensaje: {err_msg}"
+        if is_done and status in ("SUCCESS", "COMPLETE"):
+            msg += f"\n\n✅ **Recurso desplegado exitosamente.** Identificador: `{ident}`"
 
     elif tool_name == "create_template":
         tmpl = (

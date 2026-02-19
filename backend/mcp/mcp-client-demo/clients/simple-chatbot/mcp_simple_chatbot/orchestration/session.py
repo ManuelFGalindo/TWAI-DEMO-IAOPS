@@ -1,9 +1,41 @@
-import os, json, logging, asyncio
+import os, json, logging, asyncio, re
 from typing import List, Dict, Any
 from servers.base import Server
 from llm.client import LLMClient
 from servers.hooks import aws_diagram
 from servers.hooks import cfn as cfn_hook
+
+
+def _extract_first_json(text: str):
+    """
+    Extrae el primer objeto JSON válido de un texto libre.
+    - Primero intenta parsear el texto completo (limpiando código fences).
+    - Luego busca el primer '{' balanceado en el texto.
+    """
+    # 1) Limpiar código fences y probar parse directo
+    cleaned = re.sub(r"^```(?:\s*json)?\s*(.*?)\s*```$", r"\1", text, flags=re.S | re.I).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # 2) Buscar el primer bloque JSON balanceado
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == '{':
+            if start is None:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    start = None  # seguir buscando
+    return None
 
 class ChatSession:
     def __init__(self, servers: List[Server], llm_client: LLMClient) -> None:
@@ -23,12 +55,11 @@ class ChatSession:
                 logging.warning(f"Warning during final cleanup: {e}")
 
     async def process_llm_response(self, llm_response: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-        def _clean_json_string(js: str) -> str:
-            import re
-            return re.sub(r"^```(?:\s*json)?\s*(.*?)\s*```$", r"\1", js, flags=re.S|re.I).strip()
-
         try:
-            envelope = json.loads(_clean_json_string(llm_response))
+            envelope = _extract_first_json(llm_response)
+            if envelope is None:
+                return {"mode": "raw", "text": llm_response}
+
             decision = envelope.get("decision")
 
             if decision == "answer":
@@ -49,7 +80,7 @@ class ChatSession:
                 return await pipelines[tool_name](envelope)
 
             return {"mode": "raw", "text": llm_response}
-        except json.JSONDecodeError:
+        except Exception:
             return {"mode": "raw", "text": llm_response}
 
     async def _run_generate_diagram_pipeline(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
@@ -86,7 +117,6 @@ class ChatSession:
         tool_name, tool_args = cfn_hook.preprocess_cfn_tool(envelope)
         explanation = envelope.get("explanation") or ""
 
-        # Buscar servidor que tenga la tool
         for server in self.servers:
             tools = await server.list_tools()
             if any(t.name == tool_name for t in tools):
@@ -96,12 +126,79 @@ class ChatSession:
                     ok, msg, data = cfn_hook.postprocess_cfn_result(result, tool_name)
                     if explanation:
                         msg = f"{explanation.strip()}\n\n{msg}"
-                    return {"mode": "tool", "text": msg, "cfn_data": data}
+                    # Devolver siempre inmediatamente; el polling lo maneja el stream SSE
+                    return {"mode": "tool", "text": msg, "cfn_data": data, "_server": server}
                 except Exception as exc:
                     logging.exception(f"Error ejecutando CFN tool {tool_name}")
                     return {"mode": "answer", "text": f"Error al ejecutar `{tool_name}`: {exc}"}
 
-        return {"mode": "answer", "text": f"No se encontró un servidor con la herramienta '{tool_name}'. Asegúrate de que el cfn-mcp-server esté configurado."}
+        return {"mode": "answer", "text": f"No se encontró un servidor con la herramienta '{tool_name}'."}
+
+    async def poll_cfn_token(self, server, request_token: str) -> Dict[str, Any]:
+        """
+        Consulta el estado de una operación asíncrona de Cloud Control API
+        usando boto3 directamente (el tool get_request_status del MCP server
+        no está disponible en la versión instalada).
+        """
+        import asyncio
+        import os
+        import boto3
+
+        region = os.getenv("AWS_REGION", "us-east-1")
+        key_id = os.getenv("AWS_ACCESS_KEY_ID")
+        secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+        session_token = os.getenv("AWS_SESSION_TOKEN")
+
+        def _boto_poll():
+            kwargs: Dict[str, Any] = dict(
+                region_name=region,
+                aws_access_key_id=key_id,
+                aws_secret_access_key=secret,
+            )
+            if session_token:
+                kwargs["aws_session_token"] = session_token
+            client = boto3.client("cloudcontrol", **kwargs)
+            return client.get_resource_request_status(RequestToken=request_token)
+
+        loop = asyncio.get_event_loop()
+        try:
+            response = await loop.run_in_executor(None, _boto_poll)
+        except Exception as exc:
+            logging.warning(f"boto3 poll error token={request_token}: {exc}")
+            data = {"status": "UNKNOWN", "is_complete": False, "request_token": request_token}
+            return {"mode": "tool", "text": f"⚠️ Error consultando estado: {exc}", "cfn_data": data}
+
+        pe     = response.get("ProgressEvent", {})
+        status = pe.get("OperationStatus", "UNKNOWN")
+        rt     = pe.get("TypeName", "")
+        ident  = pe.get("Identifier", "N/A")
+        err    = pe.get("StatusMessage", "")
+        is_done = status in ("SUCCESS", "FAILED", "CANCEL_COMPLETE")
+
+        logging.info(f"boto3 poll token={request_token} status={status} rt={rt} ident={ident}")
+
+        data: Dict[str, Any] = {
+            "status":        status,
+            "is_complete":   is_done,
+            "resource_type": rt,
+            "identifier":    ident,
+            "request_token": request_token,
+            "error_message": err,
+        }
+
+        emoji = {"SUCCESS": "✅", "FAILED": "❌", "IN_PROGRESS": "⏳"}.get(status, "🔄")
+        msg = (
+            f"**Estado de la operación:** {emoji}\n"
+            f"- Tipo: `{rt}`\n"
+            f"- Estado: `{status}`\n"
+            f"- Identificador: `{ident}`"
+        )
+        if err:
+            msg += f"\n- Mensaje: {err}"
+        if is_done and status == "SUCCESS":
+            msg += f"\n\n✅ **Recurso desplegado exitosamente.** Identificador: `{ident}`"
+
+        return {"mode": "tool", "text": msg, "cfn_data": data}
 
     async def start(self) -> None:
         try:
